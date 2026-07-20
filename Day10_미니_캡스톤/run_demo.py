@@ -19,20 +19,28 @@ from tabetabi.render import itinerary_md, map_points
 
 
 def main() -> None:
+    # 회귀 시나리오 (DESIGN_V2_SPEC): 오모테산도 돈카츠 고정 · 고마고메 숙소.
+    # - stay_area=駒込 → 호텔은 고마고메 기준 (D1)
+    # - day_anchors {1:表参道, 2:駒込} → 동네 앵커는 station 검색으로 잡힘 (D2)
+    # - 고정 '돈카츠 ナナイド'는 DB 매칭 실패 시 external 처리·앵커 좌표 근사 (D2)
     contract = TripContract(
         pref="tokyo",
-        areas=["新宿", "銀座"],
+        areas=["表参道"],
         start_date="2026-08-22",
         end_date="2026-08-23",
         origin="서울",
         party=2,
         max_dinner_budget=8000,
-        genres_pref=["ラーメン", "寿司"],
-        locked=[LockedItem(day=1, slot="lunch", name="らぁ麺や 嶋", note="사용자 고정")],
+        genres_pref=["寿司", "焼肉"],
+        stay_area="駒込",
+        day_anchors={1: "表参道", 2: "駒込"},
+        locked=[LockedItem(day=1, slot="lunch", name="とんかつ ナナイド", note="사용자 고정")],
         notes="첫 일본 여행, 걷는 것 선호",
     )
     print("=== SHARED CONTRACT ===")
     print(contract.to_json())
+    print("\n=== 계약 요약 (사이드바 표시본 · D1) ===")
+    print(contract.summary_md())
     print("\n=== PIPELINE ===")
     t0 = time.time()
     itinerary = asyncio.run(run_pipeline(contract, log=print))

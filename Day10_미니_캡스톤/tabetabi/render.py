@@ -8,7 +8,7 @@ from __future__ import annotations
 SLOT_KO = {"lunch": "점심", "cafe": "카페", "dinner": "저녁"}
 SLOT_TIME = {"lunch": "12:00", "cafe": "15:00", "dinner": "18:30"}
 SLOT_EMOJI = {"lunch": "🍜", "cafe": "☕", "dinner": "🍣"}
-ACT_TIMES = ["10:00", "16:30", "20:30"]
+ACT_SLOT_EMOJI = {"morning": "🌅", "late_afternoon": "🏙️", "evening": "🌃"}
 
 
 def _meal_lines(m: dict) -> list[str]:
@@ -17,7 +17,8 @@ def _meal_lines(m: dict) -> list[str]:
     lock = "🔒 " if m.get("locked") else ""
     slot = SLOT_KO.get(m.get("slot"), m.get("slot"))
     if m.get("external"):
-        return [f"- **{t}** {emoji} {lock}**{slot}** · **{m['name']}** (사용자 지정 장소) · [📍 지도]({m['gmap']})"]
+        note = f" · _{m['note']}_" if m.get("note") else " (사용자 지정 장소)"
+        return [f"- **{t}** {emoji} {lock}**{slot}** · **{m['name']}**{note} · [📍 지도]({m['gmap']})"]
     rating = f"★{m['rating']}" if m.get("rating") else "★-"
     reviews = f"{m['reviews']:,}" if m.get("reviews") else "0"
     bayes = f" · 신뢰점수 {m['bayes']}" if m.get("bayes") else ""
@@ -27,8 +28,35 @@ def _meal_lines(m: dict) -> list[str]:
         f"- **{t}** {emoji} {lock}**{slot}** · [{m['name']}]({m['tabelog_url']}) — {m.get('genres', '')}"
         f" · {rating}({reviews}){bayes}{budget}{station} · [📍 지도]({m['gmap']})"
     ]
+    if m.get("off_anchor"):                       # 앵커 이탈 라벨 강제 표기 (D2, 조용한 이탈 금지)
+        lines.append(f"  - {m['off_anchor']}")
+    if m.get("relaxed"):                          # 품질 하한 완화 사유 라벨 (D5)
+        lines.append("  - ⚠️ 데이터 희소 지역 — 품질 기준 완화 적용")
     if m.get("reason"):
         lines.append(f"  - _{m['reason']}_")
+    return lines
+
+
+def _activity_lines(a: dict) -> list[str]:
+    """활동 카드 — 슬롯 시각·why + tip 1줄(필수)·영업시간/입장마감(있으면) (D3)."""
+    t = a.get("time") or "10:00"
+    emoji = ACT_SLOT_EMOJI.get(a.get("slot"), "🎡")
+    why = f" — {a['why']}" if a.get("why") else ""
+    title = a.get("title", "활동")
+    head = f"- **{t}** {emoji} [{title}]({a.get('url', '')}){why}" if a.get("url") \
+        else f"- **{t}** {emoji} **{title}**{why}"
+    lines = [head]
+    hours = []
+    if a.get("open_hours"):
+        hours.append(f"영업 {a['open_hours']}")
+    if a.get("last_entry"):
+        hours.append(f"입장마감 {a['last_entry']}")
+    if a.get("dwell_min"):
+        hours.append(f"체류 ~{a['dwell_min']}분")
+    if hours:
+        lines.append("  - 🕒 " + " · ".join(hours))
+    if a.get("tip"):                              # tip 1줄 필수 (D3 수용 기준)
+        lines.append(f"  - 💡 {a['tip']}")
     return lines
 
 
@@ -56,18 +84,15 @@ def itinerary_md(it: dict) -> str:
         L.append(f"**🌤️ 날씨** — {it['weather']}")
 
     for d in it.get("days", []):
-        L.append(f"### Day {d['day']} · {d.get('date', '')}")
+        anchor = f" · 🧭 {d['anchor']}" if d.get("anchor") else ""
+        L.append(f"### Day {d['day']} · {d.get('date', '')}{anchor}")
 
-        # 타임라인: 오전 활동 → 점심 → 카페 → 오후 활동 → 저녁 → (야간 활동)
-        acts = list(d.get("activities") or [])
-        meals = {m.get("slot"): m for m in d.get("meals", [])}
+        # 타임라인: 슬롯 시각으로 활동·식사를 한 줄에 정렬 (D3 스케줄 결과 사용)
         entries: list[tuple[str, list[str]]] = []
-        for i, a in enumerate(acts[:3]):
-            t = ACT_TIMES[i] if i < len(ACT_TIMES) else "21:00"
-            why = f" — {a['why']}" if a.get("why") else ""
-            entries.append((t, [f"- **{t}** 🎡 [{a.get('title', '활동')}]({a.get('url', '')}){why}"]))
-        for slot, m in meals.items():
-            entries.append((SLOT_TIME.get(slot, "23:00"), _meal_lines(m)))
+        for a in (d.get("activities") or []):
+            entries.append((a.get("time") or "10:00", _activity_lines(a)))
+        for m in d.get("meals", []):
+            entries.append((SLOT_TIME.get(m.get("slot"), "23:00"), _meal_lines(m)))
         entries.sort(key=lambda e: e[0])
         for _, lines in entries:
             L.extend(lines)
@@ -80,6 +105,18 @@ def itinerary_md(it: dict) -> str:
             L.append("- 🚶 **동선(최근접 정렬)** — " + "  ·  ".join(parts) + link)
         elif r.get("route_url"):
             L.append(f"- 🚶 [하루 동선 경로 열기]({r['route_url']})")
+
+    # 종일형 POI는 슬롯에 넣지 않고 별도 섹션으로만 노출한다 (D3, 예약·오픈런 팁 동반)
+    allday = it.get("allday_options") or []
+    if allday:
+        L.append("### 🎢 하루를 통째로 쓰는 옵션 (테마파크 등 — 슬롯 배정 제외)")
+        for a in allday:
+            why = f" — {a['why']}" if a.get("why") else ""
+            title = a.get("title", "옵션")
+            head = f"- [{title}]({a['url']}){why}" if a.get("url") else f"- **{title}**{why}"
+            L.append(head)
+            tip = a.get("tip") or "예약·오픈런 필수 — 이 일정은 하루 전체를 씁니다."
+            L.append(f"  - 💡 {tip}")
 
     f = it.get("flights") or {}
     if f.get("google_flights"):
