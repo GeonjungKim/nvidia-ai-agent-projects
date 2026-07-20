@@ -30,12 +30,20 @@
 
 ## 🏗️ 아키텍처
 
-컴포넌트 다이어그램
-<img src="./Readme_Images/컴포넌트다이어그램.svg" width="300" alt="프로젝트 로고">
-시퀀스 다이어그램
-<img src="./Readme_Images/시퀀스다이어그램.svg" width="300" alt="프로젝트 로고">
-클래스 다이어그램 
-<img src="./Readme_Images/클래스다이어그램.svg" width="300" alt="프로젝트 로고">
+### 🧩 컴포넌트 다이어그램
+<p align="center">
+  <img src="./Readme_Images/컴포넌트다이어그램.svg" width="600" alt="컴포넌트 다이어그램">
+</p>
+
+### 🔄 시퀀스 다이어그램
+<p align="center">
+  <img src="./Readme_Images/시퀀스다이어그램.svg" width="600" alt="시퀀스 다이어그램">
+</p>
+
+### 📦 클래스 다이어그램
+<p align="center">
+  <img src="./Readme_Images/클래스다이어그램.svg" width="600" alt="클래스 다이어그램">
+</p>
 
 **판단은 LLM이, 계산·검증·확정은 코드가 한다** — 이 원칙 하나로 전체가 설계되었습니다.
 
