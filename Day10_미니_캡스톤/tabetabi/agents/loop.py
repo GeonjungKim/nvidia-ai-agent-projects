@@ -37,8 +37,16 @@ async def resolve_model() -> str:
     return model
 
 
+def _transient_status(e: APIStatusError) -> bool:
+    """재시도해도 되는 상태 오류인가. 5xx 외에, NIM이 일시적 서버 장애(서빙 function의
+    DEGRADED 상태)를 400으로 반환하는 특이 케이스도 포함한다 — 클라이언트 잘못이 아니다."""
+    if e.status_code and e.status_code >= 500:
+        return True
+    return e.status_code == 400 and "DEGRADED" in str(e)
+
+
 async def _create(**kw):
-    """429·5xx·연결 오류 재시도 (백오프 3/8/20초)."""
+    """429·5xx·연결 오류·NIM DEGRADED 재시도 (백오프 3/8/20초)."""
     last: Exception | None = None
     for delay in (0, 3, 8, 20):
         if delay:
@@ -48,7 +56,7 @@ async def _create(**kw):
         except RateLimitError as e:
             last = e
         except APIStatusError as e:
-            if e.status_code and e.status_code >= 500:
+            if _transient_status(e):
                 last = e
             else:
                 raise
@@ -102,7 +110,7 @@ async def stream_chat(system: str, user: str, *, temperature: float = 0.2, max_t
         except RateLimitError as e:
             last = e
         except APIStatusError as e:
-            if e.status_code and e.status_code >= 500:
+            if _transient_status(e):
                 last = e
             else:
                 raise

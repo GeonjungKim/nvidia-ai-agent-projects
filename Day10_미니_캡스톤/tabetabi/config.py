@@ -54,5 +54,8 @@ def get_llm():
     global _llm
     if _llm is None:
         from openai import AsyncOpenAI
-        _llm = AsyncOpenAI(base_url=NIM_BASE_URL, api_key=NVIDIA_API_KEY)
+        # timeout: NIM 장애(DEGRADED) 시 응답이 무기한 안 오는 행 상태가 관측됨 — 기본 600초 대신
+        # 120초에서 끊어 APITimeoutError(→ APIConnectionError)로 만들고 루프의 백오프 재시도에 태운다.
+        _llm = AsyncOpenAI(base_url=NIM_BASE_URL, api_key=NVIDIA_API_KEY,
+                           timeout=float(os.getenv("LLM_TIMEOUT", "120")), max_retries=0)
     return _llm
