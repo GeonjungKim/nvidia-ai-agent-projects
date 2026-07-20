@@ -44,19 +44,37 @@ def city_of(pref: str) -> tuple[str, str]:
     return CITY_BY_PREF.get(pref, (pref, pref))
 
 
-def flight_links(origin: str, pref: str, depart: str, ret: str) -> dict:
-    """항공권 '검색' 딥링크 — 날짜·구간이 반영된 검색 결과 페이지로 이동한다."""
+# 도쿄 노선 한정 — 공항 선택 팁 (D7 메타서치 벤치마킹: 캐치프로그류의 판단 보조 가치)
+_AIRPORT_TIP = "✈️ 공항 선택 팁 — 김포~하네다: 도심 접근 우위(하네다는 도쿄 시내와 가까움) · 인천~나리타: 대체로 가격 우위 경향."
+
+
+def flight_links(origin: str, pref: str, depart: str, ret: str, party: int = 2) -> dict:
+    """항공권 '검색' 딥링크 — 날짜·구간이 반영된 검색 결과 페이지로 이동한다 (D7 v2: 4종 링크).
+
+    ①특정일 Google Flights ②스카이스캐너 월 전체 가격 캘린더(YYMM만 넘기면 달력 뷰) ③가격 알림 안내
+    ④네이버 항공권·트립닷컴·마이리얼트립 — 이 3곳은 각 사이트의 정확한 파라미터 스키마를 보증할 수
+    없어(운영 중 자주 바뀜) 그 사이트로 바로 들어가는 '검색' 링크로 둔다 — 존재하지 않는 파라미터로
+    빈 화면이 뜨는 것보다, 사이트 진입 후 사용자가 직접 검색하는 편이 더 정직하다.
+    """
     city_ko, city_en = city_of(pref)
     q = f"Flights from {origin} to {city_en} on {depart} through {ret}"
     out = {
         "google_flights": "https://www.google.com/travel/flights?q=" + urllib.parse.quote(q),
         "label": f"{origin} → {city_ko} ({depart} ~ {ret})",
+        "price_alert": "🔔 가격 알림 — Google Flights 결과 페이지에서 '가격 추적'을 켜면 이 노선의 가격 변동을 이메일로 받아볼 수 있어요.",
+        "naver": "https://search.naver.com/search.naver?query=" + urllib.parse.quote(f"네이버항공권 {origin} {city_ko} {depart} {ret}"),
+        "trip_com": "https://www.google.com/search?q=" + urllib.parse.quote(f"site:trip.com {origin} {city_en} flights {depart}"),
+        "myrealtrip": "https://www.google.com/search?q=" + urllib.parse.quote(f"site:myrealtrip.com {origin} {city_ko} 항공권 {depart}"),
     }
+    if city_ko == "도쿄":
+        out["airport_tip"] = _AIRPORT_TIP
     o, d = _SKY_CODE.get(origin), _SKY_CODE.get(city_ko)
     if o and d:
         d1 = depart.replace("-", "")[2:]   # YYMMDD
         d2 = ret.replace("-", "")[2:]
         out["skyscanner"] = f"https://www.skyscanner.co.kr/transport/flights/{o}/{d}/{d1}/{d2}/"
+        m1, m2 = depart.replace("-", "")[2:6], ret.replace("-", "")[2:6]   # YYMM — 월 단위만 주면 캘린더 뷰
+        out["skyscanner_month"] = f"https://www.skyscanner.co.kr/transport/flights/{o}/{d}/{m1}/{m2}/"
     return out
 
 

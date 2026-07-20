@@ -59,7 +59,7 @@ async def run_foodie(
         f"날짜별 검증된 검색 키(이 키로 검색하라 — area2 창작 금지): "
         f"{json.dumps(keys_view, ensure_ascii=False) if keys_view else '없음 (전 지역 bayes 상위)'}\n\n{OUTPUT_SPEC}"
     )
-    out = await run_tool_agent(
+    out, _evidence = await run_tool_agent(
         name="@foodie", server=tabelog_mcp, system=SYSTEM, task=task,
         allow={"list_areas", "list_genres", "search_restaurants"},   # 검색 결과에 상세가 다 있다 — 도구 다이어트
         max_steps=10, log=log, max_tokens=2400,

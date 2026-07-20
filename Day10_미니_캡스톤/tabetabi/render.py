@@ -121,11 +121,26 @@ def itinerary_md(it: dict) -> str:
     f = it.get("flights") or {}
     if f.get("google_flights"):
         L.append(f"### ✈️ 항공 — {f.get('label', '')}")
-        if f.get("hint"):
-            L.append(f"- 💡 {f['hint']}")
-        links = [f"[Google Flights 검색]({f['google_flights']})"]
+        if f.get("range_krw"):        # D7: 단일 '부터'가 아니라 2소스 기반 범위 (부터 표기 금지)
+            note = f" ({f['note']})" if f.get("note") else ""
+            L.append(f"- 💰 **왕복 시세** {f['range_krw']}{note}")
+        if f.get("baseline"):         # D7: 판단 기준선 1줄
+            L.append(f"- 💡 {f['baseline']}")
+        if f.get("airport_tip"):
+            L.append(f"- {f['airport_tip']}")
+        if f.get("price_alert"):
+            L.append(f"- {f['price_alert']}")
+        links = [f"[Google Flights(특정일)]({f['google_flights']})"]
         if f.get("skyscanner"):
-            links.append(f"[스카이스캐너 검색]({f['skyscanner']})")
+            links.append(f"[스카이스캐너(특정일)]({f['skyscanner']})")
+        if f.get("skyscanner_month"):
+            links.append(f"[스카이스캐너(월 캘린더)]({f['skyscanner_month']})")
+        if f.get("naver"):
+            links.append(f"[네이버 항공권]({f['naver']})")
+        if f.get("trip_com"):
+            links.append(f"[트립닷컴]({f['trip_com']})")
+        if f.get("myrealtrip"):
+            links.append(f"[마이리얼트립]({f['myrealtrip']})")
         L.append(" · ".join(links))
 
     h = it.get("hotels") or {}
@@ -138,10 +153,11 @@ def itinerary_md(it: dict) -> str:
 
     v = it.get("critic") or {}
     if v:
+        checked = f"식당 {v.get('restaurants_checked', 0)}곳 + 활동 {v.get('activities_checked', 0)}건 판정"
         if v.get("pass"):
-            L.append("✅ **@critic 검증 통과** — 추천 식당 실존·계약 준수 확인됨")
+            L.append(f"✅ **@critic 검증 통과** ({checked}) — 실존·계약 준수·활동 근거 확인됨")
         else:
-            L.append("⚠️ **@critic 지적사항** — " + "; ".join(map(str, v.get("issues", []))))
+            L.append(f"⚠️ **@critic 지적사항** ({checked}) — " + "; ".join(map(str, v.get("issues", []))))
     return "\n\n".join(L)
 
 

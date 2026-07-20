@@ -79,6 +79,48 @@ async def plain_chat(system: str, user: str, *, temperature: float = 0.2, max_to
     return r.choices[0].message.content or ""
 
 
+async def stream_chat(system: str, user: str, *, temperature: float = 0.2, max_tokens: int = 1200):
+    """도구 없는 순수 호출의 스트리밍판 — 토큰 델타를 실시간으로 yield한다 (채팅 UI 스트리밍 표시용).
+
+    재시도(429·5xx·연결 오류)는 스트림 생성 시점까지만 적용한다 — 이미 델타를 화면에 내보낸
+    뒤에는 되돌릴 수 없으므로, 스트림이 한 번 시작되면 중간 오류는 호출부로 그대로 전파해
+    ui.py가 '일부만 표시됨' 에러 상태로 처리하게 한다.
+    """
+    model = await resolve_model()
+    last: Exception | None = None
+    stream = None
+    for delay in (0, 3, 8, 20):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            stream = await get_llm().chat.completions.create(
+                model=model, temperature=temperature, max_tokens=max_tokens,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                extra_body=NO_THINK, stream=True,
+            )
+            break
+        except RateLimitError as e:
+            last = e
+        except APIStatusError as e:
+            if e.status_code and e.status_code >= 500:
+                last = e
+            else:
+                raise
+        except APIConnectionError as e:
+            last = e
+    if stream is None:
+        raise last
+    try:
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+    finally:
+        await stream.close()   # 호출부가 소비를 중도 포기해도(예외·조기 종료) 커넥션을 확실히 반납
+
+
 async def run_tool_agent(
     *,
     name: str,
@@ -90,10 +132,15 @@ async def run_tool_agent(
     log=None,
     temperature: float = 0.2,
     max_tokens: int = 1600,
-) -> str:
-    """이름 있는 역할 에이전트 하나를 도구 루프로 실행한다."""
+) -> tuple[str, list[str]]:
+    """이름 있는 역할 에이전트 하나를 도구 루프로 실행한다.
+
+    반환: (최종 텍스트, evidence) — evidence는 실제 도구 호출 결과 원문 목록이다.
+    @critic이 활동의 why·open_hours가 창작인지 판정할 근거로 쓴다 (D4, evidence 기반 검증).
+    """
     model = await resolve_model()
     log = log or (lambda s: None)
+    evidence: list[str] = []
     async with Client(server) as client:
         tools = await client.list_tools()
         if allow is not None:                      # 도구를 골라 주는 것 = 권한 경계
@@ -107,7 +154,7 @@ async def run_tool_agent(
             )).choices[0].message
             if not m.tool_calls:                   # 도구를 더 안 부르면 정상 종료
                 log(f"[{name}] ✅ 완료")
-                return m.content or ""
+                return m.content or "", evidence
             messages.append({"role": "assistant", "content": m.content or "",
                              "tool_calls": [tc.model_dump() for tc in m.tool_calls]})
             for tc in m.tool_calls:
@@ -119,6 +166,7 @@ async def run_tool_agent(
                 try:
                     res = await client.call_tool(tc.function.name, args)
                     content = json.dumps(res.data, ensure_ascii=False, default=str)
+                    evidence.append(f"[{tc.function.name}({_short(args)})] {content[:2000]}")
                 except Exception as e:             # 오류도 관찰로 되먹인다 → self-correction
                     content = "오류: " + (str(e).splitlines()[-1] if str(e) else type(e).__name__)
                     log(f"[{name}] ⚠️ {content[:120]}")
@@ -135,4 +183,4 @@ async def run_tool_agent(
             temperature=temperature, max_tokens=max_tokens, extra_body=NO_THINK,
         )).choices[0].message
         log(f"[{name}] ✅ 완료 (마무리 모드)")
-        return m.content or ""
+        return m.content or "", evidence
