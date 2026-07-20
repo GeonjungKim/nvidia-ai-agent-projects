@@ -8,10 +8,101 @@
 """
 from __future__ import annotations
 
+import re
+
 # 활동 슬롯 타입 (시각은 렌더 기준값)
 ACT_SLOTS = ("morning", "late_afternoon", "evening")
 ACT_SLOT_TIME = {"morning": "10:00", "late_afternoon": "16:30", "evening": "20:00"}
 ACT_SLOT_KO = {"morning": "오전", "late_afternoon": "늦은 오후", "evening": "저녁"}
+
+# ---------- Day Window — 항공 시간을 반영한 하루 가용 시간창 (전부 결정론) ----------
+# 원칙: 스마트 디폴트 + 가정의 가시화 + 한마디 수정. 항공 시간이 없어도 즉시 생성하되
+# 현실적인 기본 가정(첫날 낮 시작·마지막날 오후 종료)을 깔고, 배너로 가정을 명시한다.
+ARRIVAL_OVERHEAD_MIN = 150      # 입국심사·수하물 ~60분 + 공항→도심 이동 ~90분
+DEPART_OVERHEAD_MIN = 210       # 도심→공항 ~90분 + 국제선 2시간 전 공항 도착
+DEFAULT_FIRST_DAY_START = 12 * 60 + 30   # 항공 미정: 오전 항공편(ICN 07~09시 발) 도착 가정
+DEFAULT_LAST_DAY_END = 15 * 60           # 항공 미정: 15:00 공항 출발 가정
+DAY_START, DAY_END = 9 * 60, 22 * 60     # 평일반 하루 활동 범위
+
+MEAL_NOMINAL = {"lunch": 12 * 60, "cafe": 15 * 60, "dinner": 18 * 60 + 30}
+LUNCH_LATEST = 14 * 60 + 30              # 이보다 늦으면 점심 슬롯 무의미
+
+
+def hhmm_to_min(s) -> int | None:
+    m = re.match(r"^(\d{1,2}):(\d{2})$", str(s or "").strip())
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    return h * 60 + mi if 0 <= h <= 23 and 0 <= mi <= 59 else None
+
+
+def min_to_hhmm(m: int) -> str:
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def day_window(day: int, num_days: int, arrival_time: str = "", departure_time: str = "") -> dict:
+    """그날의 (시작, 종료) 가용 시간창과 사용자에게 보여줄 가정 배너를 계산한다.
+
+    첫날은 도착편, 마지막날은 귀국편이 창을 좁힌다. 시간 미정이면 기본 가정을 쓰되
+    assumed_* 플래그와 배너로 '가정임'을 숨기지 않는다 (조용한 가정 금지).
+    """
+    start, end = DAY_START, DAY_END
+    assumed_start = assumed_end = False
+    notes: list[str] = []
+    if day == 1:
+        a = hhmm_to_min(arrival_time)
+        if a is not None:
+            start = max(start, a + ARRIVAL_OVERHEAD_MIN)
+            notes.append(f"✈️ {arrival_time} 도착 기준 — 입국·이동 포함 {min_to_hhmm(start)}부터 일정 시작")
+        else:
+            start, assumed_start = DEFAULT_FIRST_DAY_START, True
+            notes.append(f"✈️ 첫날은 오전 항공편 도착 가정으로 {min_to_hhmm(start)}부터 시작해요 — "
+                         "도착 시간을 알려주시면 맞춰 드려요")
+    if day == num_days:
+        d = hhmm_to_min(departure_time)
+        if d is not None:
+            end = min(end, max(d - DEPART_OVERHEAD_MIN, start))
+            notes.append(f"🛫 귀국편 {departure_time} 출발 — {min_to_hhmm(end)}에는 공항으로 이동을 시작하세요")
+        else:
+            end, assumed_end = DEFAULT_LAST_DAY_END, True
+            notes.append(f"🛫 귀국편 미정 — {min_to_hhmm(end)} 공항 출발 가정으로 저녁 전에 마무리했어요. "
+                         "출발 시간을 알려주시면 조정해 드려요")
+    if end <= start:
+        notes.append("⚠️ 항공 시간을 반영하면 이 날은 자유 시간이 거의 없어요")
+    return {"start": start, "end": end, "assumed_start": assumed_start, "assumed_end": assumed_end,
+            "banner": " · ".join(notes)}
+
+
+def plan_meal_slots(start: int, end: int) -> dict[str, int]:
+    """시간창 안에 들어가는 식사 슬롯과 시각(분)을 결정한다 — 창 밖 슬롯은 아예 뺀다.
+
+    규칙: 점심은 14:30 이후면 무의미 → 제외. 저녁은 종료 60분 전까지 시작 가능해야 함.
+    카페는 점심+90분 이후, 저녁 60분 전까지. 고정(locked) 슬롯은 이 계획과 무관하게 계약이 이긴다.
+    """
+    times: dict[str, int] = {}
+    lunch = max(MEAL_NOMINAL["lunch"], start + 15)
+    if lunch <= LUNCH_LATEST and lunch + 60 <= end:
+        times["lunch"] = lunch
+    dinner = max(MEAL_NOMINAL["dinner"], start + 15)
+    if dinner + 60 <= end:
+        times["dinner"] = dinner
+    cafe = max(MEAL_NOMINAL["cafe"], times.get("lunch", start) + 90)
+    cafe_cap = min(end, times.get("dinner", end) - 60)
+    if cafe + 45 <= cafe_cap:
+        times["cafe"] = cafe
+    return times
+
+
+def allowed_activity_slots(start: int, end: int) -> set[str]:
+    """시간창 안에서 배치 가능한 활동 슬롯 — 창 밖(도착 전 오전, 출국일 저녁 등)은 제외."""
+    allowed: set[str] = set()
+    if start <= 10 * 60 and end >= 11 * 60 + 30:
+        allowed.add("morning")
+    if start <= 16 * 60 + 30 and end >= 17 * 60 + 30:
+        allowed.add("late_afternoon")
+    if start <= 20 * 60 and end >= 21 * 60:
+        allowed.add("evening")
+    return allowed
 
 # 종일형 POI 차단 목록 — 슬롯 배정 금지, 하단 '하루를 통째로 쓰는 옵션'에만 노출 (S3)
 ALLDAY_KEYWORDS = (
@@ -100,7 +191,8 @@ def _valid_best_time(bt) -> str | None:
     return aliases.get(bt)
 
 
-def schedule_day(items: list[dict], seen_titles: set[str], log=None, day: int = 0) -> tuple[list[dict], list[dict]]:
+def schedule_day(items: list[dict], seen_titles: set[str], log=None, day: int = 0,
+                 allowed: set[str] | None = None) -> tuple[list[dict], list[dict]]:
     """하루 활동을 슬롯 규칙에 맞게 배치한다 (D3 + D4 코드 게이트).
 
     - 종일형 POI는 슬롯에서 제외하고 allday 목록으로 분리한다.
@@ -138,6 +230,8 @@ def schedule_day(items: list[dict], seen_titles: set[str], log=None, day: int = 
         order = [want] + [s for s in ACT_SLOTS if s != want]
         placed = False
         for slot in order:
+            if allowed is not None and slot not in allowed:   # 시간창 밖 슬롯 (항공 시간 반영)
+                continue
             if slot in scheduled:
                 continue
             if slot_forbids(slot, cat):

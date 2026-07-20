@@ -23,7 +23,9 @@ from tabetabi.agents.scout import run_scout
 from tabetabi.anchors import deviation_km, off_anchor_label, resolve_anchor
 from tabetabi.contract import TripContract, extract_json
 from tabetabi.geo import order_day_route
-from tabetabi.links import city_of, external_place_link, flight_links, hotel_links
+from tabetabi.links import (city_of, external_place_link, external_web_search_link,
+                            flight_links, google_search_url, hotel_links)
+from tabetabi.places import places_resolve
 from tabetabi.resolve import resolve_place
 from tabetabi.tools.tabelog_server import fetch_by_ids, pref_codes, search_lib
 
@@ -46,7 +48,8 @@ def _pref_hint() -> str:
 
 
 CONCIERGE_SYSTEM = """너는 'TabeTabi' 미식 여행 컨시어지다. 사용자와 한국어로 대화하며 여행 계약(contract)을 완성한다.
-- 필수: pref(지역 코드), start_date/end_date(YYYY-MM-DD). 선택: areas(세부지역, 일본어 지명), stay_area(숙소역), day_anchors, theme_park, origin(출발 도시), party(인원), max_dinner_budget(엔, 숫자), genres_pref(일본어 장르), locked, notes.
+- 필수: pref(지역 코드), start_date/end_date(YYYY-MM-DD). 선택: areas(세부지역, 일본어 지명), stay_area(숙소역), day_anchors, theme_park, origin(출발 도시), party(인원), max_dinner_budget(엔, 숫자), genres_pref(일본어 장르), arrival_time/departure_time(HH:MM), locked, notes.
+- **항공 시간**: 첫날 현지 도착 시각은 arrival_time, 마지막날 귀국편 출발 시각은 departure_time에 HH:MM으로 넣는다. "아침 비행기로 도착"→"10:00", "밤 9시 출발 귀국편"→"21:00"처럼 대략값도 좋다. 언급이 없으면 비워둔다 (일정은 기본 가정으로 만들어진다 — 굳이 캐묻지 마라).
 - 사용자가 언급한 '고정' 식당·장소·일정은 반드시 locked 배열에 넣는다: {"day": 1부터(미정 0), "slot": "lunch|dinner|activity|stay", "name": "...", "note": "..."}. 이건 절대 바꾸면 안 되는 약속이다.
 - **숙소**: "○○역 쪽에서 묵을 예정"·"○○에 숙소" 같은 말은 stay_area(일본어 역/지명)에 넣는다. notes에만 남기지 마라. 예: "고마고메역 쪽" → stay_area:"駒込". (locked의 stay 슬롯으로 들어와도 stay_area로 승격된다.)
 - **일자별 앵커(day_anchors)**: {"1":"表参道","2":"駒込"}처럼 각 날의 중심 지역. 고정 식당·장소가 있는 날은 그 지역, 마지막 날은 stay_area 인접, 나머지는 areas 순환으로 제안한다. 사용자가 대화로 수정하면 반영한다. 지정 안 하면 비워둬도 코드가 자동 채운다.
@@ -223,7 +226,9 @@ def _resolve_locked(contract: TripContract, anchor_keys: dict[int, dict], log) -
             log(f"[계약] 🔒 {lk.day}일차 {lk.slot} '{lk.name}' → DB 확정 (id {hit['restaurant_id']}, {r['stage']}단계)")
         elif r["stage"] == 4 and r["candidates"]:
             cand_desc = ", ".join(f"{c['name']}({c['restaurant_id']})" for c in r["candidates"])
-            resolved[(lk.day, lk.slot)] = {"external": True, "name": lk.name}
+            # 근접 후보를 버리지 않고 들고 간다 — 일정 카드에서 "혹시 이 곳?" 제안으로 노출 (UX)
+            resolved[(lk.day, lk.slot)] = {"external": True, "name": lk.name,
+                                           "candidates": [c["restaurant_id"] for c in r["candidates"][:2]]}
             log(f"[계약] 🔒 {lk.day}일차 {lk.slot} '{lk.name}' → 자동 매칭 불확실(4단계·미확인) "
                 f"→ 사용자 지정 이름 그대로 반영. 근접 후보: {cand_desc}")
         else:
@@ -247,22 +252,45 @@ def pending_lock_confirmations(draft: dict) -> list[dict]:
             continue
         if "[사용자 확인" in (lk.note or ""):
             continue
-        anchor_kw = resolve_anchor(contract.pref, anchors.get(lk.day, "")).get("search_kwargs", {})
+        anchor_label = anchors.get(lk.day, "")
+        anchor_kw = resolve_anchor(contract.pref, anchor_label).get("search_kwargs", {})
         r = resolve_place(contract.pref, lk.name, anchor_kwargs=anchor_kw)
         if r["stage"] == 4 and r["candidates"]:
-            pend.append({"day": lk.day, "slot": lk.slot, "name": lk.name, "candidates": r["candidates"]})
+            # 증거 카드용: 앵커에서의 직선거리를 결정론으로 붙인다 (유저가 "내가 아는 그 가게"인지 판단할 근거)
+            for c in r["candidates"]:
+                st0 = c["stations"][0] if c.get("stations") else ""
+                c["_dist_km"] = deviation_km(contract.pref, anchor_label, st0) if (anchor_label and st0) else None
+            pend.append({"day": lk.day, "slot": lk.slot, "name": lk.name,
+                         "anchor": anchor_label, "candidates": r["candidates"]})
     return pend
 
 
 def _confirm_question(p: dict) -> str:
-    """후보 제시 질문 — 코드 템플릿(LLM 창작 아님, D6)."""
-    lines = [f"'{p['name']}' 이름과 정확히 일치하는 곳을 못 찾았어요 ({p['day']}일차 {p['slot']}). 혹시 이 중 하나인가요?"]
+    """후보 제시 질문 — 코드 템플릿(LLM 창작 아님, D6).
+
+    증거 카드: 이름만으로는 유저가 '내가 아는 그 가게'인지 알 수 없다 (실사례: とんかつ七井戸를
+    이름·역만 보고 거절). 평점·리뷰수·지역·앵커 거리·타베로그/지도 링크를 함께 보여준다.
+    """
+    lines = [f"'{p['name']}' 이름과 정확히 일치하는 곳을 DB에서 못 찾았어요 ({p['day']}일차 {p['slot']}). "
+             "비슷한 곳을 찾았는데, 혹시 이 중 하나인가요?"]
     for i, c in enumerate(p["candidates"], 1):
         station = c["stations"][0] if c.get("stations") else ""
-        bits = [x for x in (f"{station}역" if station else "", c.get("genres") or "") if x]
-        lines.append(f"{i}) {c['name']}" + (f" · {' · '.join(bits)}" if bits else ""))
+        bits = []
+        if c.get("genres"):
+            bits.append(c["genres"])
+        if c.get("tabelog_rating"):
+            rv = f"(리뷰 {c['tabelog_review_count']:,})" if c.get("tabelog_review_count") else ""
+            bits.append(f"★{c['tabelog_rating']}{rv}")
+        if station:
+            bits.append(f"{station}역")
+        if c.get("_dist_km") is not None and p.get("anchor"):
+            bits.append(f"{p['anchor']}에서 직선 ~{c['_dist_km']}km")
+        links = " · ".join(x for x in (
+            f"[타베로그]({c['tabelog_url']})" if c.get("tabelog_url") else "",
+            f"[📍 지도]({c['gmap']})" if c.get("gmap") else "") if x)
+        lines.append(f"**{i}) {c['name']}** — " + " · ".join(bits) + (f"\n   {links}" if links else ""))
     lines.append("번호로 답해 주시거나, 없으면 '그대로'라고 답해 주세요 — 지정하신 이름 그대로(DB 외) 반영할게요.")
-    return "\n".join(lines)
+    return "\n\n".join(lines)
 
 
 def _apply_lock_confirm_reply(draft: dict, user_text: str, pend: list[dict]) -> dict:
@@ -429,8 +457,12 @@ def _picks_from(merged: dict, foodie_data: dict, contract: TripContract, locked_
     return picks
 
 
-def _backfill(picks: list[dict], contract: TripContract, anchor_keys: dict[int, dict], log) -> list[dict]:
-    """비어 있는 day×slot을 결정론 검색으로 채운다 — 앵커 검색키 + 품질 하한(≥50/≥3.4), 희소 시 라벨 완화 (D2·D5)."""
+def _backfill(picks: list[dict], contract: TripContract, anchor_keys: dict[int, dict], log,
+              meal_times: dict[int, dict] | None = None) -> list[dict]:
+    """비어 있는 day×slot을 결정론 검색으로 채운다 — 앵커 검색키 + 품질 하한(≥50/≥3.4), 희소 시 라벨 완화 (D2·D5).
+
+    meal_times가 주어지면 시간창 밖 슬롯(항공 시간과 겹침)은 백필하지 않는다.
+    """
     have = {(p["day"], p["slot"]) for p in picks}
     used = {p["restaurant_id"] for p in picks if p.get("restaurant_id")}
     day_genres: dict[int, set] = {}
@@ -445,6 +477,8 @@ def _backfill(picks: list[dict], contract: TripContract, anchor_keys: dict[int, 
         for i, slot in enumerate(_SLOT_ORDER):
             if (day, slot) in have:
                 continue
+            if meal_times is not None and slot not in meal_times.get(day, {}):
+                continue   # 시간창 밖 슬롯 — 백필 금지 (항공 시간 반영)
             budget = contract.max_dinner_budget if slot == "dinner" else None
             genre = "カフェ" if slot == "cafe" else genres[(day + i) % len(genres)]
             taken = day_genres.get(day, set())
@@ -502,6 +536,52 @@ def _sanitize_flight(flight: dict) -> dict:
     }
 
 
+_SLOT_KO_P = {"lunch": "점심", "cafe": "카페", "dinner": "저녁"}
+
+
+def _emit_partial(on_partial, stage: str, md: str) -> None:
+    """부분 결과 콜백 — UI 콜백 오류가 파이프라인을 죽이지 않게 감싼다 (fail-soft)."""
+    if on_partial:
+        try:
+            on_partial(stage, md)
+        except Exception:
+            pass
+
+
+def _partial_md(contract: TripContract, picks: list[dict], day_anchors: dict[int, str],
+                acts_by_day: dict[int, list[dict]] | None = None, stage_note: str = "") -> str:
+    """잠정 라인업 마크다운 — 식당이 확정되는 즉시 사용자에게 먼저 보여준다 (progressive UX).
+
+    최종 카드(검증·휴무·동선·팁)와 달리 한 줄 요약만 — '기다림의 체감'을 줄이는 게 목적이다.
+    """
+    rows = fetch_by_ids([p["restaurant_id"] for p in picks if p.get("restaurant_id")])
+    L = [f"#### ⚡ 식당 라인업 (잠정) — {stage_note}"]
+    for day in range(1, contract.num_days + 1):
+        parts = []
+        for slot in _SLOT_ORDER:
+            p = next((x for x in picks if x["day"] == day and x["slot"] == slot), None)
+            if not p:
+                continue
+            lock = "🔒 " if p.get("locked") else ""
+            r = rows.get(p.get("restaurant_id"))
+            star = f" ★{r['tabelog_rating']}" if r and r.get("tabelog_rating") else ""
+            parts.append(f"{_SLOT_KO_P[slot]} {lock}{(r or p).get('name', '')}{star}")
+        anchor = day_anchors.get(day, "")
+        head = f"**Day{day}**" + (f" ({anchor})" if anchor else "")
+        L.append(f"- {head}: " + (" · ".join(parts) if parts else "_항공 시간과 겹쳐 식사 슬롯 없음_"))
+    if acts_by_day:
+        act_lines = []
+        for day in range(1, contract.num_days + 1):
+            titles = [a.get("title", "") for a in acts_by_day.get(day, []) if a.get("title")]
+            if titles:
+                act_lines.append(f"- **Day{day} 활동**: " + " · ".join(titles))
+        if act_lines:
+            L.append("#### 🔭 주변 활동 (잠정)")
+            L.extend(act_lines)
+    L.append(f"_{'⚖️ @critic 검증·동선 계산 중… 최종 일정이 곧 표시됩니다' if acts_by_day else '🔭 @scout이 활동·날씨·호텔·항공을 조사 중…'}_")
+    return "\n\n".join(L)
+
+
 def _build_comment(contract: TripContract, picks: list[dict], day_anchors: dict[int, str]) -> str:
     """선정 이유 코멘트 — 코드 템플릿 (D4). LLM 자유 서술 금지: '표참도에서 교통 편리' 같은
     검색 근거 없는 창작이나 '시스템 내 식당으로 정정' 같은 허위 정정 서술의 재발을 구조로 차단한다.
@@ -522,7 +602,13 @@ def _build_comment(contract: TripContract, picks: list[dict], day_anchors: dict[
     return " · ".join(parts) + "으로 구성했어요."
 
 
-async def run_pipeline(contract: TripContract, log=None) -> dict:
+async def run_pipeline(contract: TripContract, log=None, on_partial=None) -> dict:
+    """일정 생성 파이프라인.
+
+    on_partial(stage, md): 부분 결과 콜백 (선택) — 식당 라인업이 확정되는 즉시("meals"),
+    활동 조사가 끝나는 즉시("activities") 잠정 마크다운을 UI에 먼저 흘린다.
+    최종 반환값은 기존과 동일한 완성 일정 dict.
+    """
     log = log or (lambda s: None)
     log("[계약] SHARED CONTRACT 고정 — locked 항목은 어떤 에이전트도 변경 불가")
 
@@ -537,29 +623,52 @@ async def run_pipeline(contract: TripContract, log=None) -> dict:
 
     locked_map = _resolve_locked(contract, anchor_keys, log)
 
+    # Day Window (항공 시간 반영, 결정론): 창 밖 식사 슬롯은 처음부터 열지 않는다 —
+    # 고정(locked) 슬롯은 계약이 이기므로 창과 무관하게 유지된다.
+    windows = {d: timemodel.day_window(d, contract.num_days, contract.arrival_time, contract.departure_time)
+               for d in range(1, contract.num_days + 1)}
+    meal_times = {d: timemodel.plan_meal_slots(w["start"], w["end"]) for d, w in windows.items()}
+    for d, w in windows.items():
+        if w["banner"]:
+            log(f"[시간창] {d}일차 {timemodel.min_to_hhmm(w['start'])}~{timemodel.min_to_hhmm(w['end'])} — {w['banner']}")
+        for s in _SLOT_ORDER:
+            if s not in meal_times[d] and (d, s) not in locked_map:
+                log(f"[시간창] {d}일차 {s}: 항공·이동 시간과 겹쳐 슬롯 제외")
+
     open_slots = [(d, s) for d in range(1, contract.num_days + 1) for s in _SLOT_ORDER
-                  if (d, s) not in locked_map]
+                  if (d, s) not in locked_map and s in meal_times[d]]
     fixed_view = [{"day": d, "slot": s,
                    **{k: v for k, v in info.items() if k in ("restaurant_id", "name", "external")}}
                   for (d, s), info in sorted(locked_map.items())]
 
-    log("[배치1] @foodie ∥ @scout 병렬 리서치 시작 (asyncio.gather)")
-    if open_slots:
-        foodie_data, scout_data = await asyncio.gather(
-            run_foodie(contract, open_slots, fixed_view, anchor_keys=anchor_keys, log=log),
-            run_scout(contract, log=log),
-        )
-    else:                                   # 모든 식사가 고정된 극단 케이스
-        foodie_data = {"slots": []}
-        scout_data = await run_scout(contract, log=log)
-    n_items = sum(len(x.get("items") or []) for x in scout_data.get("days", []))
-    log(f"[배치1] 완료 — 식당 후보 슬롯 {len(foodie_data.get('slots', []))}개 · 활동 {n_items}건")
-    foodie_data = _sanitize_foodie(foodie_data, log)
+    # 배치1: @scout은 태스크로 띄워 두고(느린 웹검색), @foodie → 병합을 먼저 끝내
+    # 식당 라인업을 즉시 사용자에게 보여준다 (progressive). 병합이 scout 완료를 기다리지
+    # 않으므로 전체 시간도 단축된다. scout 결과는 병합 판단에 필수가 아니다 (후보는 foodie 전용).
+    log("[배치1] @foodie ∥ @scout 병렬 리서치 시작 (scout은 백그라운드 태스크)")
+    scout_task = asyncio.create_task(run_scout(contract, log=log))
+    try:
+        if open_slots:
+            foodie_data = await run_foodie(contract, open_slots, fixed_view, anchor_keys=anchor_keys, log=log)
+        else:                               # 모든 식사가 고정된 극단 케이스
+            foodie_data = {"slots": []}
+        log(f"[배치1] @foodie 완료 — 식당 후보 슬롯 {len(foodie_data.get('slots', []))}개")
+        foodie_data = _sanitize_foodie(foodie_data, log)
 
-    log("[병합] @concierge 슬롯별 최종 선정 (후보 밖 선택은 코드가 교정)")
-    merged = await _merge(contract, foodie_data, scout_data, fixed_view)
-    picks = _picks_from(merged, foodie_data, contract, locked_map, log)
-    picks = _backfill(picks, contract, anchor_keys, log)
+        log("[병합] @concierge 슬롯별 최종 선정 (후보 밖 선택은 코드가 교정)")
+        merged = await _merge(contract, foodie_data,
+                              {"note": "(@scout 조사 진행 중 — 슬롯 선정은 후보 내에서만 한다)"},
+                              fixed_view)
+        picks = _picks_from(merged, foodie_data, contract, locked_map, log)
+        picks = _backfill(picks, contract, anchor_keys, log, meal_times=meal_times)
+        _emit_partial(on_partial, "meals",
+                      _partial_md(contract, picks, day_anchors, stage_note="검증 전 초안"))
+
+        scout_data = await scout_task
+    except BaseException:
+        scout_task.cancel()                 # foodie/병합 실패 시 scout 고아 태스크 방지
+        raise
+    n_items = sum(len(x.get("items") or []) for x in scout_data.get("days", []))
+    log(f"[배치1] @scout 완료 — 활동 {n_items}건")
 
     scout_by_day = {}
     for d in scout_data.get("days", []):
@@ -574,12 +683,18 @@ async def run_pipeline(contract: TripContract, log=None) -> dict:
     scheduled_acts: dict[int, list[dict]] = {}
     allday_options: list[dict] = []
     for day in range(1, contract.num_days + 1):
-        acts, allday = timemodel.schedule_day(scout_by_day.get(day, []), seen_titles, log=log, day=day)
+        w = windows[day]
+        acts, allday = timemodel.schedule_day(
+            scout_by_day.get(day, []), seen_titles, log=log, day=day,
+            allowed=timemodel.allowed_activity_slots(w["start"], w["end"]))
         scheduled_acts[day] = acts
         allday_options.extend(allday)
     flat_acts = [{"day": d, **{k: a[k] for k in ("title", "why", "area", "open_hours", "last_entry", "slot") if k in a}}
                  for d, acts in scheduled_acts.items() for a in acts]
     evidence = str(scout_data.get("_evidence") or "")[:6000]
+    _emit_partial(on_partial, "activities",
+                  _partial_md(contract, picks, day_anchors, acts_by_day=scheduled_acts,
+                              stage_note="검증 전 초안"))
 
     log("[게이트] @critic 읽기 전용 검증 시작 — 식당 + 활동")
     def _critic_view(ps):
@@ -592,7 +707,7 @@ async def run_pipeline(contract: TripContract, log=None) -> dict:
         merged = await _merge(contract, foodie_data, scout_data, fixed_view,
                               extra_note="; ".join(map(str, verdict["issues"])))
         picks = _picks_from(merged, foodie_data, contract, locked_map, log)
-        picks = _backfill(picks, contract, anchor_keys, log)
+        picks = _backfill(picks, contract, anchor_keys, log, meal_times=meal_times)
         verdict = await run_critic(contract, _critic_view(picks), activities=flat_acts, evidence=evidence,
                                    day_anchors=day_anchors, flight=scout_data.get("flight"), log=log)
     # 판정 건수는 코드가 확정한다 (D4 수용 기준: "식당 N곳 + 활동 M건 판정"을 항상 포함)
@@ -602,19 +717,51 @@ async def run_pipeline(contract: TripContract, log=None) -> dict:
 
     log("[로지스틱스] 앵커 이탈 검증·동선·딥링크 (결정론 도구)")
     alt_pool_ids = [aid for p in picks for aid in (p.get("alt_ids") or [])]
-    rows = fetch_by_ids([p["restaurant_id"] for p in picks if p.get("restaurant_id")] + alt_pool_ids)
+    ext_cand_ids = [cid for p in picks if p.get("external") for cid in (p.get("candidates") or [])]
+    rows = fetch_by_ids([p["restaurant_id"] for p in picks if p.get("restaurant_id")]
+                        + alt_pool_ids + ext_cand_ids)
 
     days_out = []
     for day in range(1, contract.num_days + 1):
         anchor = day_anchors.get(day, "")
         anchor_station = anchor  # 앵커 문자열 자체가 역명 (표参道 등) — external·이탈 판정 기준
+        date_str = contract.date_of(day)
+        # 방문일의 일본식 요일 문자 — 식당 정기휴무(closed_days)와 대조해 경고를 띄운다 (결정론 팁)
+        jp_wd = "月火水木金土日"[date.fromisoformat(date_str).weekday()] if date_str else ""
         meals, route_places = [], []
         for p in [x for x in picks if x["day"] == day]:
+            # 시간창 기반 슬롯 시각 (창 밖 고정 슬롯은 명목 시각으로 렌더 폴백)
+            t_min = meal_times.get(day, {}).get(p["slot"])
+            t_str = timemodel.min_to_hhmm(t_min) if t_min else ""
             if p.get("external"):
                 # external 고정 장소: 앵커 역 좌표로 근사해 동선·지도에 포함한다 (D2)
+                # 지도 링크에 앵커 역을 넣어 검색 반경을 좁히고(도시 전역 오검색 방지),
+                # 지도가 핀을 못 잡을 경우를 대비해 웹 검색 링크와 DB 근접 후보 제안을 함께 준다.
+                sugg = [
+                    {"restaurant_id": cid, "name": cr["name"],
+                     "tabelog_url": cr.get("tabelog_url"), "gmap": cr.get("gmap"),
+                     "rating": cr.get("tabelog_rating"), "reviews": cr.get("tabelog_review_count"),
+                     "station": cr["stations"][0] if cr.get("stations") else ""}
+                    for cid in (p.get("candidates") or []) if (cr := rows.get(cid))
+                ]
+                gmap = (google_search_url(p["name"], anchor_station) if anchor_station
+                        else external_place_link(p["name"], contract.pref))
+                # Places API(키 설정 시): 정식 명칭·주소·핀 확정 링크로 업그레이드 (실패 시 위 폴백 유지)
+                place = places_resolve(p["name"], anchor_station, city_of(contract.pref)[1])
+                address = canonical = ""
+                if place:
+                    gmap = place["maps_url"] or gmap
+                    address = place["address"]
+                    if place["name"] and place["name"] != p["name"]:
+                        canonical = place["name"]
+                    log(f"[지도] {day}일차 {p['slot']}: Places 확인 — {place['name'] or p['name']}")
                 meals.append({"slot": p["slot"], "locked": True, "external": True, "name": p["name"],
+                              "time": t_str,
                               "station": anchor_station, "note": "DB 미등록 — 지정 이름 그대로 반영",
-                              "gmap": external_place_link(p["name"], contract.pref)})
+                              "gmap": gmap, "address": address, "canonical": canonical,
+                              "pin_verified": bool(place),
+                              "web": external_web_search_link(p["name"], anchor_station, contract.pref),
+                              "suggestions": sugg})
                 if anchor_station:
                     route_places.append({"name": p["name"], "station": anchor_station})
                 continue
@@ -632,19 +779,28 @@ async def run_pipeline(contract: TripContract, log=None) -> dict:
                     log(f"[이탈] {day}일차 {p['slot']}: {r['name']} — {off_label}")
             # D8: 선택되지 않은 후보 최대 3곳 — 슬롯 카드의 "다른 후보 보기"용 (LLM 재호출 없이 즉시 표시)
             alternatives = [
-                {"name": ar["name"], "tabelog_url": ar.get("tabelog_url"), "gmap": ar.get("gmap"),
+                {"restaurant_id": aid, "name": ar["name"],
+                 "tabelog_url": ar.get("tabelog_url"), "gmap": ar.get("gmap"),
                  "rating": ar.get("tabelog_rating"), "reviews": ar.get("tabelog_review_count"),
                  "station": ar["stations"][0] if ar.get("stations") else ""}
                 for aid in (p.get("alt_ids") or []) if (ar := rows.get(aid))
             ]
+            closed = (r.get("closed_days") or "").strip()
+            # '祝日(공휴일)'의 日이 일요일(日)과 오검출되지 않게 제거 후 요일 문자를 대조한다
+            closed_warn = bool(jp_wd and closed
+                               and jp_wd in closed.replace("祝日", "").replace("祭日", ""))
+            if closed_warn:
+                log(f"[휴무] ⚠️ {day}일차 {p['slot']}: {r['name']} — 정기휴무({closed})가 방문일({date_str})과 겹칠 수 있음")
             meals.append({
                 "slot": p["slot"], "locked": p.get("locked", False), "external": False,
+                "restaurant_id": p.get("restaurant_id", ""), "time": t_str,
                 "name": r["name"], "genres": r.get("genres") or "",
                 "rating": r.get("tabelog_rating"), "reviews": r.get("tabelog_review_count"),
                 "bayes": r.get("bayes_score"),
                 "budget": r.get("budget_dinner") if p["slot"] == "dinner" else r.get("budget_lunch"),
                 "station": st0, "tabelog_url": r.get("tabelog_url"), "gmap": r.get("gmap"),
                 "reason": p.get("reason", ""), "off_anchor": off_label, "relaxed": p.get("relaxed", False),
+                "closed": closed, "closed_warn": closed_warn,
                 "alternatives": alternatives,
             })
             if st0:
@@ -653,6 +809,9 @@ async def run_pipeline(contract: TripContract, log=None) -> dict:
         # 식사는 시간순(점심→카페→저녁)이 고정이므로 NN 재정렬 없이 순서 유지
         route = order_day_route(route_places, keep_order=True) if route_places else {"order": [], "route_url": "", "legs": [], "points": []}
         days_out.append({"day": day, "date": contract.date_of(day), "anchor": anchor,
+                         "banner": windows[day]["banner"],
+                         "window": {"start": timemodel.min_to_hhmm(windows[day]["start"]),
+                                    "end": timemodel.min_to_hhmm(windows[day]["end"])},
                          "meals": meals, "activities": scheduled_acts.get(day, []), "route": route})
 
     hotel_area = contract.hotel_anchor() or str(merged.get("hotel_area") or "")   # 숙소 앵커 우선 (D1)
@@ -679,4 +838,69 @@ async def run_pipeline(contract: TripContract, log=None) -> dict:
         "stats": stats,
     }
     log("[완료] 일정표 생성 ✅")
+    return itinerary
+
+
+def swap_meal(itinerary: dict, day: int, slot: str, new_id: str) -> dict | None:
+    """일정의 한 슬롯을 사전 계산된 대안/제안으로 교체한다 — LLM 재호출 없는 결정론 연산 (D8 확장).
+
+    교체 전 픽은 대안 목록 맨 앞에 남겨 '되돌리기'가 가능하고, 그날 동선(route)도 재계산한다.
+    유령 id·없는 슬롯이면 None (호출부가 무시).
+    """
+    new_id = str(new_id)
+    row = fetch_by_ids([new_id]).get(new_id)
+    if not row:
+        return None
+    d = next((x for x in itinerary.get("days", []) if x.get("day") == day), None)
+    if not d:
+        return None
+    idx = next((i for i, m in enumerate(d.get("meals", [])) if m.get("slot") == slot), None)
+    if idx is None:
+        return None
+    old = d["meals"][idx]
+    pref = str((itinerary.get("contract") or {}).get("pref") or "")
+    anchor = str(d.get("anchor") or "")
+    st0 = row["stations"][0] if row.get("stations") else ""
+
+    # 요일-휴무 대조 (파이프라인과 동일 규칙)
+    try:
+        jp_wd = "月火水木金土日"[date.fromisoformat(d.get("date") or "").weekday()]
+    except (ValueError, TypeError):
+        jp_wd = ""
+    closed = (row.get("closed_days") or "").strip()
+    closed_warn = bool(jp_wd and closed and jp_wd in closed.replace("祝日", "").replace("祭日", ""))
+    off_label = off_anchor_label(deviation_km(pref, anchor, st0)) if (anchor and st0) else ""
+
+    # 대안 목록 재구성: 이전 픽(되돌리기용, DB 픽일 때만) + 기존 대안·제안 중 새 픽 제외
+    pool = (old.get("alternatives") or []) + (old.get("suggestions") or [])
+    alts = [a for a in pool if str(a.get("restaurant_id") or "") not in ("", new_id)]
+    if not old.get("external") and old.get("restaurant_id"):
+        alts = [{"restaurant_id": old["restaurant_id"], "name": old.get("name", ""),
+                 "tabelog_url": old.get("tabelog_url"), "gmap": old.get("gmap"),
+                 "rating": old.get("rating"), "reviews": old.get("reviews"),
+                 "station": old.get("station", "")}] + alts
+
+    d["meals"][idx] = {
+        "slot": slot, "locked": bool(old.get("locked")), "external": False,
+        "restaurant_id": new_id, "time": old.get("time", ""),
+        "name": row["name"], "genres": row.get("genres") or "",
+        "rating": row.get("tabelog_rating"), "reviews": row.get("tabelog_review_count"),
+        "bayes": row.get("bayes_score"),
+        "budget": row.get("budget_dinner") if slot == "dinner" else row.get("budget_lunch"),
+        "station": st0, "tabelog_url": row.get("tabelog_url"), "gmap": row.get("gmap"),
+        "reason": "사용자 고정 — 제안에서 채택" if old.get("external") else "사용자 선택 — 대안에서 교체",
+        "off_anchor": off_label, "closed": closed, "closed_warn": closed_warn,
+        "alternatives": alts[:3],
+    }
+
+    # 그날 동선 재계산 (식사 시간순 유지, external은 앵커 역 근사 — 파이프라인과 동일)
+    route_places = []
+    for m in sorted(d["meals"], key=lambda m: _SLOT_ORDER.index(m["slot"]) if m["slot"] in _SLOT_ORDER else 9):
+        if m.get("external"):
+            if anchor:
+                route_places.append({"name": m["name"], "station": anchor})
+        elif m.get("station"):
+            route_places.append({"name": m["name"], "station": m["station"]})
+    d["route"] = order_day_route(route_places, keep_order=True) if route_places \
+        else {"order": [], "route_url": "", "legs": [], "points": []}
     return itinerary

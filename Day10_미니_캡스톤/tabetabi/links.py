@@ -92,7 +92,20 @@ def hotel_links(area: str, pref: str, checkin: str, checkout: str, adults: int =
             "label": f"{area or city_ko} 숙소 ({checkin} ~ {checkout}, 성인 {adults})"}
 
 
-def external_place_link(name: str, pref: str) -> str:
-    """DB에 없는(사용자 지정) 장소용 구글지도 검색 링크."""
+def external_place_link(name: str, pref: str, area: str = "") -> str:
+    """DB에 없는(사용자 지정) 장소용 구글지도 검색 링크.
+
+    도시명만 붙이면 도쿄 전역에서 엉뚱한 다수 결과가 나온다(실측: '豚カツナナイド Tokyo' 핀 실패)
+    — 앵커 역/지역이 있으면 함께 넣어 검색 반경을 좁힌다.
+    """
     _, city_en = city_of(pref)
-    return "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote(f"{name} {city_en}")
+    q = " ".join(x for x in (name, f"{area}駅" if area else "", city_en) if x)
+    return "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote(q)
+
+
+def external_web_search_link(name: str, area: str, pref: str) -> str:
+    """DB 미등록 장소용 구글 '웹' 검색 링크 — 지도가 핀을 못 잡는 이름(표기 변형·오타)은
+    웹 검색이 블로그·타베로그 등에서 더 잘 찾아준다 (지도 링크의 보조 수단)."""
+    city_ko, _ = city_of(pref)
+    q = " ".join(x for x in (name, area, city_ko, "맛집") if x)
+    return "https://www.google.com/search?q=" + urllib.parse.quote(q)

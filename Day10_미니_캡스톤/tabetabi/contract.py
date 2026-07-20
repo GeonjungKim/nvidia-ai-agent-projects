@@ -56,6 +56,27 @@ def normalize_area(a) -> str:
 _SLOT_ALIASES = {"점심": "lunch", "런치": "lunch", "브런치": "lunch", "저녁": "dinner", "디너": "dinner",
                  "카페": "cafe", "디저트": "cafe", "숙소": "stay", "활동": "activity", "관광": "activity"}
 
+_TIME_RE = re.compile(r"(\d{1,2})\s*[:시]\s*(\d{1,2})?")
+
+
+def normalize_time(t) -> str:
+    """항공 시간 표기 정규화 → 'HH:MM' 또는 ''. '10:30' '9시' '오후 8시' 모두 수용."""
+    s = str(t or "").strip()
+    if not s:
+        return ""
+    m = _TIME_RE.search(s)
+    if not m:
+        return ""
+    try:
+        h, mi = int(m.group(1)), int(m.group(2) or 0)
+    except (ValueError, TypeError):
+        return ""
+    if h <= 11 and any(k in s for k in ("오후", "저녁", "밤", "pm", "PM")):
+        h += 12
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        return ""
+    return f"{h:02d}:{mi:02d}"
+
 
 @dataclass
 class LockedItem:
@@ -79,6 +100,8 @@ class TripContract:
     stay_area: str = ""                 # 숙소 앵커 (일본어 역/지명, 예: 駒込) — 1급 시민 (D1)
     day_anchors: dict[int, str] = field(default_factory=dict)   # 일자별 앵커 (사용자 수정 가능, D1)
     theme_park: bool = False            # 테마파크 종일 일정 의향 (D3)
+    arrival_time: str = ""              # 첫날 현지 도착 시각 HH:MM (미정이면 "" → 기본 가정)
+    departure_time: str = ""            # 마지막날 귀국편 출발 시각 HH:MM (미정이면 "")
     notes: str = ""
 
     @property
@@ -184,6 +207,8 @@ class TripContract:
             stay_area=stay_area,
             day_anchors=day_anchors,
             theme_park=bool(d.get("theme_park")),
+            arrival_time=normalize_time(d.get("arrival_time")),
+            departure_time=normalize_time(d.get("departure_time")),
             notes=str(d.get("notes") or ""),
         )
 
@@ -198,6 +223,12 @@ class TripContract:
             lines.append("🧭 **일자별 앵커** " + " / ".join(f"Day{d}: {a}" for d, a in sorted(anchors.items())))
         if self.theme_park:
             lines.append("🎢 **테마파크** 하루 통째 일정 편성 의향 있음")
+        if self.arrival_time or self.departure_time:
+            seg = ([f"도착 {self.arrival_time}"] if self.arrival_time else []) \
+                + ([f"귀국편 출발 {self.departure_time}"] if self.departure_time else [])
+            lines.append("✈️ **항공 시간(현지)** " + " · ".join(seg))
+        else:
+            lines.append("✈️ **항공 시간** 미정 — 첫날 낮 도착·마지막날 오후 출발 가정으로 일정 구성")
         if self.max_dinner_budget:
             lines.append(f"**저녁 예산** 1인 ~¥{self.max_dinner_budget:,}")
         if self.genres_pref:

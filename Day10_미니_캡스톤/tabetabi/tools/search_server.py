@@ -23,12 +23,8 @@ def _tavily():
     return _client
 
 
-@mcp.tool
-def web_search(query: str, max_results: int = 5) -> list[dict]:
-    """웹에서 최신 정보를 검색한다 (관광지·이벤트·날씨 등). 결과: title/url/snippet.
-
-    검색어는 구체적으로 쓸 것 (예: '2026년 8월 도쿄 신주쿠 주변 가볼만한 곳').
-    """
+def web_search_lib(query: str, max_results: int = 5) -> list[dict]:
+    """web_search의 라이브러리판 — MCP 도구와 결정론 코드(resolve의 웹 조인)가 같은 로직을 쓴다."""
     from tabetabi.config import TAVILY_API_KEY
     max_results = max(1, min(int(max_results), 8))
     if not TAVILY_API_KEY:
@@ -43,3 +39,12 @@ def web_search(query: str, max_results: int = 5) -> list[dict]:
         {"title": x.get("title", ""), "url": x.get("url", ""), "snippet": (x.get("content") or "")[:300]}
         for x in r.get("results", [])
     ]
+
+
+@mcp.tool
+def web_search(query: str, max_results: int = 5) -> list[dict]:
+    """웹에서 최신 정보를 검색한다 (관광지·이벤트·날씨 등). 결과: title/url/snippet.
+
+    검색어는 구체적으로 쓸 것 (예: '2026년 8월 도쿄 신주쿠 주변 가볼만한 곳').
+    """
+    return web_search_lib(query, max_results)

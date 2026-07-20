@@ -11,14 +11,41 @@ SLOT_EMOJI = {"lunch": "🍜", "cafe": "☕", "dinner": "🍣"}
 ACT_SLOT_EMOJI = {"morning": "🌅", "late_afternoon": "🏙️", "evening": "🌃"}
 
 
+def _alt_line(alts: list[dict]) -> str:
+    """대안 후보 1줄 — 카드 안에서 바로 갈아탈 수 있게 (별도 섹션으로 숨기지 않는다)."""
+    parts = []
+    for a in alts[:3]:
+        station = f" · {a['station']}역" if a.get("station") else ""
+        rating = f" ★{a['rating']}" if a.get("rating") else ""
+        parts.append(f"[{a['name']}]({a.get('tabelog_url') or a.get('gmap', '')}){rating}{station}")
+    return "  - 🔀 다른 후보: " + " / ".join(parts)
+
+
 def _meal_lines(m: dict) -> list[str]:
-    t = SLOT_TIME.get(m.get("slot"), "")
+    t = m.get("time") or SLOT_TIME.get(m.get("slot"), "")   # 시간창 기반 동적 시각 우선
     emoji = SLOT_EMOJI.get(m.get("slot"), "🍽️")
     lock = "🔒 " if m.get("locked") else ""
     slot = SLOT_KO.get(m.get("slot"), m.get("slot"))
     if m.get("external"):
-        note = f" · _{m['note']}_" if m.get("note") else " (사용자 지정 장소)"
-        return [f"- **{t}** {emoji} {lock}**{slot}** · **{m['name']}**{note} · [📍 지도]({m['gmap']})"]
+        web = f" · [🔎 웹 검색]({m['web']})" if m.get("web") else ""
+        map_label = "📍 지도" if m.get("pin_verified") else "📍 지도 검색"
+        lines = [f"- **{t}** {emoji} {lock}**{slot}** · **{m['name']}** · [{map_label}]({m['gmap']}){web}"]
+        if m.get("pin_verified"):     # Places 확인됨 — 정확한 핀. 주소·정식 표기를 근거로 제시
+            detail = " · ".join(x for x in (
+                f"지도 표기: {m['canonical']}" if m.get("canonical") else "",
+                m.get("address") or "") if x)
+            lines.append(f"  - ✅ 구글 지도에서 위치 확인됨{(' — ' + detail) if detail else ''} "
+                         "(타베로그 DB 미등록 — 평점·휴무는 검증 불가)")
+        else:
+            lines.append("  - ⚠️ 타베로그 DB 미등록 — 평점·휴무 검증 불가. 이름 표기가 다르면 지도 검색이 "
+                         "엉뚱한 곳을 보여줄 수 있으니 웹 검색으로 교차 확인하세요.")
+        for s in (m.get("suggestions") or [])[:2]:   # 4단계 매칭의 근접 후보 — "혹시 이 곳?"
+            rating = f"★{s['rating']}" if s.get("rating") else "★-"
+            station = f" · {s['station']}역" if s.get("station") else ""
+            gmap = f" · [📍 지도]({s['gmap']})" if s.get("gmap") else ""
+            lines.append(f"  - 🔍 혹시 이 곳 아닌가요? [{s['name']}]({s.get('tabelog_url', '')}) — "
+                         f"{rating}{station}{gmap} · 맞다면 채팅에 \"고정 식당을 {s['name']}(으)로 바꿔줘\"라고 말씀해 주세요")
+        return lines
     rating = f"★{m['rating']}" if m.get("rating") else "★-"
     reviews = f"{m['reviews']:,}" if m.get("reviews") else "0"
     bayes = f" · 신뢰점수 {m['bayes']}" if m.get("bayes") else ""
@@ -32,8 +59,16 @@ def _meal_lines(m: dict) -> list[str]:
         lines.append(f"  - {m['off_anchor']}")
     if m.get("relaxed"):                          # 품질 하한 완화 사유 라벨 (D5)
         lines.append("  - ⚠️ 데이터 희소 지역 — 품질 기준 완화 적용")
+    closed = m.get("closed")
+    if closed and "無休" not in closed:           # 정기휴무 표기 + 방문일 겹침 경고 (결정론 대조)
+        if m.get("closed_warn"):
+            lines.append(f"  - 🚨 **정기휴무 {closed} — 방문일과 겹칠 수 있어요!** 예약·방문 전 꼭 확인하세요")
+        else:
+            lines.append(f"  - 🗓️ 정기휴무: {closed}")
     if m.get("reason"):
         lines.append(f"  - _{m['reason']}_")
+    if m.get("alternatives"):                     # 대안을 카드 안에 인라인 — 클릭 한 번 거리로 (UX)
+        lines.append(_alt_line(m["alternatives"]))
     return lines
 
 
@@ -86,13 +121,15 @@ def itinerary_md(it: dict) -> str:
     for d in it.get("days", []):
         anchor = f" · 🧭 {d['anchor']}" if d.get("anchor") else ""
         L.append(f"### Day {d['day']} · {d.get('date', '')}{anchor}")
+        if d.get("banner"):                       # 항공 시간 가정/반영 배너 (조용한 가정 금지)
+            L.append(f"> {d['banner']}")
 
         # 타임라인: 슬롯 시각으로 활동·식사를 한 줄에 정렬 (D3 스케줄 결과 사용)
         entries: list[tuple[str, list[str]]] = []
         for a in (d.get("activities") or []):
             entries.append((a.get("time") or "10:00", _activity_lines(a)))
         for m in d.get("meals", []):
-            entries.append((SLOT_TIME.get(m.get("slot"), "23:00"), _meal_lines(m)))
+            entries.append((m.get("time") or SLOT_TIME.get(m.get("slot"), "23:00"), _meal_lines(m)))
         entries.sort(key=lambda e: e[0])
         for _, lines in entries:
             L.extend(lines)

@@ -86,25 +86,51 @@ def load_session(session_id: str) -> dict | None:
 
 
 def list_sessions(user_key: str, limit: int = 10) -> list[dict]:
-    """이 사용자(user_key)의 대화 히스토리 — 최근 수정순. 사이드바 '지난 대화' 목록용."""
+    """이 사용자(user_key)의 대화 히스토리 — 최근 수정순. 사이드바 대화 목록용.
+
+    제목 우선순위: 첫 사용자 메시지 요약 → 도시·기간 → "새 대화" (ChatGPT/Claude식 목록 UX).
+    """
+    from tabetabi.links import city_of
     conn = _conn()
     try:
         rows = conn.execute(
-            "SELECT session_id, updated_at, draft_json, itinerary_json FROM sessions "
+            "SELECT session_id, updated_at, draft_json, messages_json, itinerary_json FROM sessions "
             "WHERE user_key = ? ORDER BY updated_at DESC LIMIT ?",
             (user_key, max(1, limit)),
         ).fetchall()
         out = []
         for r in rows:
             draft = json.loads(r["draft_json"]) if r["draft_json"] else {}
-            pref = draft.get("pref") or "새 대화"
-            dates = f" {draft.get('start_date', '')}~{draft.get('end_date', '')}" if draft.get("start_date") else ""
+            try:
+                msgs = json.loads(r["messages_json"]) if r["messages_json"] else []
+            except (json.JSONDecodeError, TypeError):
+                msgs = []
+            first_user = next((str(m.get("content", "")).strip().replace("\n", " ")
+                               for m in msgs if m.get("role") == "user"), "")
+            if first_user:
+                label = first_user[:24] + ("…" if len(first_user) > 24 else "")
+            elif draft.get("pref"):
+                city_ko, _ = city_of(draft["pref"])
+                dates = f" {draft.get('start_date', '')}~" if draft.get("start_date") else ""
+                label = f"{city_ko}{dates}".strip()
+            else:
+                label = "새 대화"
             out.append({
                 "session_id": r["session_id"],
                 "updated_at": r["updated_at"],
-                "label": f"{pref}{dates}".strip(),
+                "label": label,
                 "has_itinerary": bool(r["itinerary_json"]),
             })
         return out
+    finally:
+        conn.close()
+
+
+def delete_session(session_id: str, user_key: str) -> None:
+    """세션 삭제 — user_key까지 일치해야 지운다 (다른 사용자 세션 삭제 방지)."""
+    conn = _conn()
+    try:
+        conn.execute("DELETE FROM sessions WHERE session_id = ? AND user_key = ?", (session_id, user_key))
+        conn.commit()
     finally:
         conn.close()

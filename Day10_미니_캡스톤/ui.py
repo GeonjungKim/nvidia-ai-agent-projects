@@ -15,12 +15,12 @@ import pandas as pd
 import streamlit as st
 
 from tabetabi import store
-from tabetabi.agents.concierge import ConciergeTurn, run_pipeline
+from tabetabi.agents.concierge import ConciergeTurn, run_pipeline, swap_meal
 from tabetabi.anchors import resolve_anchor
 from tabetabi.config import DEFAULT_MODEL, TAVILY_API_KEY
 from tabetabi.contract import TripContract
 from tabetabi.render import itinerary_md, map_points
-from tabetabi.tools.tabelog_server import db_stats, list_genres, pref_codes, search_lib
+from tabetabi.tools.tabelog_server import db_stats, list_areas, list_genres, pref_codes, search_lib
 
 st.set_page_config(page_title="TabeTabi — 미식 여행 컨시어지", page_icon="🍜", layout="wide")
 
@@ -103,22 +103,55 @@ def _persist_session() -> None:
     except Exception:
         pass   # 저장 실패해도 현재 세션 동작에는 영향 없음 (fail-soft)
 
-# ---------- 사이드바 ----------
+def _reset_view_state() -> None:
+    """세션 전환·삭제 시 화면 상태를 비운다 — 다음 rerun에서 DB 기준으로 다시 로드된다."""
+    for k in ("msgs", "draft", "ready", "itinerary", "map_df", "logs"):
+        ss.pop(k, None)
+
+
+# ---------- 사이드바 (대화 목록을 최상단에 — ChatGPT/Claude식 내비게이션) ----------
 with st.sidebar:
     st.title("🍜 TabeTabi")
-    st.caption("멀티에이전트 미식 여행 컨시어지 · Day10 미니 캡스톤")
-    try:
-        stats = db_stats()
-        c1, c2 = st.columns(2)
-        c1.metric("식당 데이터", f"{stats['restaurants']:,}곳")
-        c2.metric("지역(pref)", f"{stats['prefs']}개")
-    except Exception:
-        st.error("타베로그 DB에 연결하지 못했어요 (TABELOG_DB 경로를 확인하세요).", icon="🛑")
-    st.caption(f"LLM: `{DEFAULT_MODEL}` · NVIDIA NIM")
-    if TAVILY_API_KEY:
-        st.success("웹검색: Tavily 활성", icon="🔎")
+    st.caption("멀티에이전트 미식 여행 컨시어지")
+
+    if st.button("➕ 새 대화", type="primary", use_container_width=True):
+        ss.session_id = store.new_session_id()
+        if not LOGGED_IN:
+            st.query_params["sid"] = ss.session_id
+        _reset_view_state()
+        st.rerun()
+
+    # 대화 목록 — 항상 보이게, 클릭 한 번으로 전환·삭제 (expander에 숨기지 않는다)
+    if LOGGED_IN:
+        try:
+            past = store.list_sessions(USER_KEY, limit=15)
+        except Exception:
+            past = []
+        if past:
+            st.subheader("💬 대화 목록")
+            for s in past:
+                current = s["session_id"] == ss.session_id
+                icon = "📋 " if s["has_itinerary"] else ""
+                col_open, col_del = st.columns([6, 1])
+                if col_open.button(("▶ " if current else "") + icon + s["label"],
+                                   key=f"sess_{s['session_id']}", disabled=current,
+                                   use_container_width=True,
+                                   help=f"마지막 수정 {s['updated_at'][:16].replace('T', ' ')} UTC"):
+                    ss.session_id = s["session_id"]
+                    _reset_view_state()
+                    st.rerun()
+                if col_del.button("🗑️", key=f"del_{s['session_id']}", help="이 대화 삭제"):
+                    try:
+                        store.delete_session(s["session_id"], USER_KEY)
+                    except Exception:
+                        pass
+                    if current:
+                        ss.session_id = store.new_session_id()
+                        _reset_view_state()
+                    st.rerun()
     else:
-        st.warning("웹검색: 폴백 모드 — .env에 TAVILY_API_KEY 추가", icon="🔗")
+        st.caption("🔐 로그인하면 대화 목록이 계정에 보관되고, 여기서 바로 전환할 수 있어요.")
+
     st.divider()
     st.subheader("📋 SHARED CONTRACT")
     if ss.draft:
@@ -134,13 +167,19 @@ with st.sidebar:
             "- **@critic** — 읽기 전용 검증 게이트\n\n"
             "허용 도구 목록 = 권한 경계 (Day9 원칙)"
         )
-    if st.button("➕ 새 대화 시작", use_container_width=True):
-        ss.session_id = store.new_session_id()
-        if not LOGGED_IN:
-            st.query_params["sid"] = ss.session_id
-        for k in ("msgs", "draft", "ready", "itinerary", "map_df", "logs"):
-            ss.pop(k, None)
-        st.rerun()
+    with st.expander("ℹ️ 데이터·모델 상태"):
+        try:
+            stats = db_stats()
+            c1, c2 = st.columns(2)
+            c1.metric("식당 데이터", f"{stats['restaurants']:,}곳")
+            c2.metric("지역(pref)", f"{stats['prefs']}개")
+        except Exception:
+            st.error("타베로그 DB에 연결하지 못했어요 (TABELOG_DB 경로를 확인하세요).", icon="🛑")
+        st.caption(f"LLM: `{DEFAULT_MODEL}` · NVIDIA NIM")
+        if TAVILY_API_KEY:
+            st.success("웹검색: Tavily 활성", icon="🔎")
+        else:
+            st.warning("웹검색: 폴백 모드 — .env에 TAVILY_API_KEY 추가", icon="🔗")
 
     st.divider()
     st.subheader("👤 계정")
@@ -154,25 +193,6 @@ with st.sidebar:
         st.caption("로그인하면 대화 히스토리가 계정에 저장돼요.")
         if st.button("🔐 Google로 로그인", use_container_width=True):
             st.login()
-
-    # 가점: DB 저장 — 로그인 사용자의 지난 대화 목록 (계정별 히스토리)
-    if LOGGED_IN:
-        try:
-            past = store.list_sessions(USER_KEY, limit=10)
-        except Exception:
-            past = []
-        others = [s for s in past if s["session_id"] != ss.session_id]
-        if others:
-            with st.expander(f"🗂️ 지난 대화 ({len(others)}개)"):
-                for s in others:
-                    label = f"{s['label']} · {s['updated_at'][:16].replace('T', ' ')}"
-                    if s["has_itinerary"]:
-                        label += " 📋"
-                    if st.button(label, key=f"sess_{s['session_id']}", use_container_width=True):
-                        ss.session_id = s["session_id"]
-                        for k in ("msgs", "draft", "ready", "itinerary", "map_df", "logs"):
-                            ss.pop(k, None)
-                        st.rerun()
 
 # ---------- 탭: 대화 / 지역 랭킹 탐색 (D8) ----------
 tab_chat, tab_rank = st.tabs(["💬 여행 계획", "📃 지역 랭킹 탐색"])
@@ -195,12 +215,17 @@ with tab_chat:
         if st.button("🚀 이 계약으로 일정 생성 — 에이전트 팀 출동", type="primary", use_container_width=True):
             contract = TripContract.from_dict(ss.draft)
             logs: list[str] = []
+            # 부분 결과 우선 표시: 식당 라인업이 확정되는 즉시 이 자리에 잠정 표시된다
+            # (최종 일정이 채팅에 붙으면 rerun으로 사라짐 — 실패 시엔 잠정 결과가 남는다, fail-soft)
+            partial_box = st.empty()
             try:
                 with st.status("🤝 에이전트 팀 작업 중… (@foodie ∥ @scout 병렬)", expanded=True) as status:
                     def log(s: str):
                         logs.append(s)
                         status.write(s)
-                    it = asyncio.run(run_pipeline(contract, log=log))
+                    it = asyncio.run(run_pipeline(
+                        contract, log=log,
+                        on_partial=lambda stage, md: partial_box.markdown(md)))
                     status.update(label="✅ 일정 완성!", state="complete")
                 ss.itinerary = it
                 ss.logs = logs
@@ -211,7 +236,8 @@ with tab_chat:
                 st.rerun()
             except Exception:
                 ss.logs = logs
-                st.error("일정 생성 중 오류가 발생했어요. 아래 상세를 확인해 주세요.")
+                st.error("일정 생성 중 오류가 발생했어요. 아래 상세를 확인해 주세요. "
+                         "(위에 잠정 라인업이 보인다면 거기까지는 확정된 결과예요)")
                 st.code(traceback.format_exc()[-1500:])
 
     if ss.itinerary is not None:
@@ -220,21 +246,59 @@ with tab_chat:
             ss.map_df = None
             st.rerun()
 
-        # D8: 슬롯 카드의 "다른 후보 보기" — 파이프라인이 이미 계산해 둔 대안(LLM 재호출 없음)
-        alt_days = [d for d in ss.itinerary.get("days", []) if any(m.get("alternatives") for m in d.get("meals", []))]
-        if alt_days:
-            with st.expander("🔀 슬롯별 다른 후보 보기"):
-                for d in alt_days:
-                    for m in d.get("meals", []):
-                        if not m.get("alternatives"):
-                            continue
-                        st.markdown(f"**Day{d['day']} {m.get('slot')}** — 확정: {m.get('name')}")
-                        for a in m["alternatives"]:
-                            rating = f"★{a['rating']}" if a.get("rating") else "★-"
-                            reviews = f"{a['reviews']:,}" if a.get("reviews") else "0"
-                            station = f" · {a['station']}역" if a.get("station") else ""
-                            st.markdown(f"- [{a['name']}]({a.get('tabelog_url','')}) — {rating}({reviews}){station}")
-                st.caption("더 많은 후보는 옆의 '📃 지역 랭킹 탐색' 탭에서 지역·장르 필터로 확인하세요.")
+        # 슬롯 즉시 교체 — 파이프라인이 계산해 둔 대안/제안으로 LLM 재호출 없이 바로 바꾼다
+        _SLOT_KO = {"lunch": "점심", "cafe": "카페", "dinner": "저녁"}
+        swap_rows = []
+        for d in ss.itinerary.get("days", []):
+            for m in d.get("meals", []):
+                if m.get("locked") and not m.get("external"):
+                    continue   # DB 고정 슬롯은 계약 — 교체 대상 제외
+                pool = (m.get("alternatives") or []) + (m.get("suggestions") or [])
+                alts = [a for a in pool if a.get("restaurant_id")]
+                if alts:
+                    swap_rows.append((d, m, alts))
+        if swap_rows:
+            with st.expander("🔀 슬롯 즉시 교체 — 대안으로 바로 바꾸기 (LLM 재호출 없음)"):
+                for d, m, alts in swap_rows:
+                    label = _SLOT_KO.get(m["slot"], m["slot"])
+                    tag = " (DB 미등록 — 제안 채택 시 정식 확정)" if m.get("external") else ""
+                    c1, c2, c3 = st.columns([4, 5, 1])
+                    c1.markdown(f"**Day{d['day']} {label}**{tag}\n\n{m['name']}")
+                    opts = [f"{a['name']}" + (f" ★{a['rating']}" if a.get("rating") else "")
+                            + (f" · {a['station']}역" if a.get("station") else "") for a in alts]
+                    sel = c2.selectbox("대안 선택", opts, key=f"swapsel_{d['day']}_{m['slot']}",
+                                       label_visibility="collapsed")
+                    if c3.button("교체", key=f"swapbtn_{d['day']}_{m['slot']}"):
+                        a = alts[opts.index(sel)]
+                        new_it = swap_meal(ss.itinerary, d["day"], m["slot"], a["restaurant_id"])
+                        if new_it:
+                            if m.get("external"):
+                                # 제안 채택 → 계약의 고정 이름도 DB 정식 표기로 승격 (재생성 시 1단계 즉시 확정)
+                                _alias = {"점심": "lunch", "런치": "lunch", "브런치": "lunch",
+                                          "저녁": "dinner", "디너": "dinner", "카페": "cafe", "디저트": "cafe"}
+                                locked = []
+                                for lk in ss.draft.get("locked") or []:
+                                    lk_slot = str(lk.get("slot") or "").strip().lower() if isinstance(lk, dict) else ""
+                                    lk_slot = _alias.get(lk_slot, lk_slot)
+                                    try:
+                                        lk_day = int(lk.get("day") or 0) if isinstance(lk, dict) else 0
+                                    except (ValueError, TypeError):
+                                        lk_day = 0
+                                    if isinstance(lk, dict) and lk_day == d["day"] and lk_slot == m["slot"]:
+                                        lk = {**lk, "name": a["name"],
+                                              "note": (str(lk.get("note") or "") + f" [사용자 확인: {a['name']}]").strip()}
+                                    locked.append(lk)
+                                ss.draft = {**ss.draft, "locked": locked}
+                            ss.itinerary = new_it
+                            for i in range(len(ss.msgs) - 1, -1, -1):   # 채팅의 일정 메시지도 갱신
+                                if ss.msgs[i]["role"] == "assistant" and str(ss.msgs[i]["content"]).startswith("## 🗾"):
+                                    ss.msgs[i]["content"] = itinerary_md(new_it)
+                                    break
+                            pts = map_points(new_it)
+                            ss.map_df = pd.DataFrame(pts)[["lat", "lon"]] if pts else None
+                            _persist_session()
+                            st.rerun()
+                st.caption("🔒 고정 슬롯은 계약이라 제외됩니다. 여기 없는 식당은 '📃 지역 랭킹 탐색' 탭에서 📌로 고정한 뒤 재생성하세요.")
 
     # ---------- 채팅 입력 (LLM 응답 실시간 스트리밍 + 오류 상태 처리) ----------
     prompt = st.chat_input("여행 계획을 말씀해 주세요…")
@@ -272,7 +336,8 @@ with tab_chat:
 with tab_rank:
     # ---------- D8: 지역 랭킹 탐색 — 일정 생성과 무관하게 즉시 열람 (LLM 호출 0회) ----------
     st.subheader("📃 지역 랭킹 탐색")
-    st.caption("타베로그 베이지안 랭킹을 그대로 노출합니다 — 일정 생성 없이도 즉시 응답 (LLM 미사용).")
+    st.caption("타베로그 베이지안 랭킹을 그대로 노출합니다 — 일정 생성 없이도 즉시 응답 (LLM 미사용). "
+               "계약이 있으면 **기본값만** 미리 채워질 뿐, 지역·앵커·장르 모두 자유롭게 바꿀 수 있어요.")
 
     try:
         contract_draft = TripContract.from_dict(ss.draft) if ss.draft else TripContract()
@@ -288,17 +353,27 @@ with tab_rank:
         pref_sel = st.selectbox("지역", pref_options, index=pref_options.index(default_pref) if default_pref in pref_options else 0,
                                 key="rank_pref")
 
-        # 프리셋: 계약의 day_anchors·areas·stay_area가 미리 선택된 상태로 진입 (D8 요구사항)
-        anchor_pool = list(dict.fromkeys(
-            [a for a in contract_draft.effective_day_anchors().values() if a]
-            + contract_draft.areas
-            + ([contract_draft.stay_area] if contract_draft.stay_area else [])
-        ))
-        anchor_choice = st.selectbox("앵커(역/지역)", ["(전체)"] + anchor_pool, key="rank_anchor")
+        # 앵커 선택지 = 계약 앵커(기본값 편의) + 해당 pref의 DB 세부지역 상위 30 + 직접 입력.
+        # 계약이 있어도 선택지가 계약 지역에 갇히지 않는다 — 탐색 탭은 자유 열람이 목적.
+        contract_anchors = []
+        if contract_draft.pref == pref_sel:
+            contract_anchors = [a for a in contract_draft.effective_day_anchors().values() if a] \
+                + contract_draft.areas \
+                + ([contract_draft.stay_area] if contract_draft.stay_area else [])
+        try:
+            db_areas = [a["area2"] for a in list_areas(pref_sel)]
+        except Exception:
+            db_areas = []
+        anchor_pool = list(dict.fromkeys(contract_anchors + db_areas))
+        anchor_choice = st.selectbox("앵커(역/세부지역)", ["(전체)"] + anchor_pool, key="rank_anchor")
+        custom_anchor = st.text_input("목록에 없는 역/지명 직접 입력 (일본어 표기 — 예: 中野, 吉祥寺, 恵比寿)",
+                                      key="rank_anchor_custom",
+                                      help="입력하면 위 선택보다 우선 적용됩니다. 비우면 위 선택을 따라요.")
+        chosen_anchor = custom_anchor.strip() or ("" if anchor_choice == "(전체)" else anchor_choice)
         anchor_kwargs: dict = {}
         try:
-            if anchor_choice != "(전체)":
-                info = resolve_anchor(pref_sel, anchor_choice)
+            if chosen_anchor:
+                info = resolve_anchor(pref_sel, chosen_anchor)
                 anchor_kwargs = info.get("search_kwargs") or {}
                 st.caption(info["log"])
 
@@ -311,10 +386,11 @@ with tab_rank:
         genre_sel = st.multiselect("장르 (복수 선택 가능 — 계약의 선호 장르가 미리 선택돼 있어요)",
                                    genre_options, default=default_genres, key="rank_genres")
 
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         budget = c1.number_input("저녁 예산 상한(엔, 0=제한 없음)", min_value=0, step=500,
                                  value=contract_draft.max_dinner_budget or 0, key="rank_budget")
         sort_sel = c2.selectbox("정렬", ["bayes", "rating", "reviews"], key="rank_sort")
+        n_show = c3.selectbox("표시 개수", [10, 20, 30, 50], index=2, key="rank_limit")
 
         with st.spinner("검색 중…"):
             try:
@@ -323,15 +399,15 @@ with tab_rank:
                     results = []
                     for g in genre_sel:
                         for r in search_lib(pref=pref_sel, genre=g, max_dinner_budget=budget or None,
-                                            sort=sort_sel, limit=30, **anchor_kwargs):
+                                            sort=sort_sel, limit=n_show, **anchor_kwargs):
                             if r["restaurant_id"] not in seen_ids:
                                 seen_ids.add(r["restaurant_id"])
                                 results.append(r)
                     results.sort(key=lambda r: (r.get("bayes_score") is None, -(r.get("bayes_score") or 0)))
-                    results = results[:30]
+                    results = results[:n_show]
                 else:
                     results = search_lib(pref=pref_sel, max_dinner_budget=budget or None, sort=sort_sel,
-                                         limit=30, **anchor_kwargs)
+                                         limit=n_show, **anchor_kwargs)
             except Exception:
                 st.error("랭킹 조회 중 오류가 발생했어요. 필터를 바꿔 다시 시도해 주세요.", icon="🛑")
                 results = []
@@ -339,14 +415,44 @@ with tab_rank:
         if not results:
             st.info("조건에 맞는 식당이 없어요 — 필터를 완화해 보세요.")
         else:
-            st.caption(f"상위 {len(results)}곳")
+            # 📌 고정: 자유 텍스트 이름 매칭의 근본 대체 — DB 정식 표기가 계약에 직접 들어가
+            # 매칭 불확실성이 0이 된다 (external 문제 원천 차단)
+            st.caption(f"상위 {len(results)}곳 — 각 행의 📌 버튼으로 일정 계약에 바로 고정할 수 있어요")
+            _SLOT_KO_RANK = {"lunch": "점심", "cafe": "카페", "dinner": "저녁"}
+            nd = contract_draft.num_days or 0
+            pc1, pc2 = st.columns(2)
+            pin_day = pc1.number_input("고정할 일차 (Day)", min_value=1, max_value=nd if nd else 14,
+                                       value=1, key="pin_day")
+            pin_slot = pc2.selectbox("고정할 슬롯", ["lunch", "cafe", "dinner"],
+                                     format_func=lambda s: _SLOT_KO_RANK[s], key="pin_slot")
+            if ss.get("pin_done"):
+                st.success(ss.pop("pin_done"))
             for r in results:
                 rating = f"★{r['tabelog_rating']}" if r.get("tabelog_rating") else "★-"
                 reviews = f"{r['tabelog_review_count']:,}" if r.get("tabelog_review_count") else "0"
                 bayes = f" · 신뢰점수 {r['bayes_score']}" if r.get("bayes_score") else ""
                 budget_txt = f" · 저녁 {r['budget_dinner']}" if r.get("budget_dinner") else ""
                 station = f" · {r['stations'][0]}역" if r.get("stations") else ""
-                st.markdown(
+                rc1, rc2 = st.columns([12, 1])
+                rc1.markdown(
                     f"- [{r['name']}]({r['tabelog_url']}) — {r.get('genres', '')} · {rating}({reviews}){bayes}{budget_txt}{station}"
                     f" · [📍 지도]({r['gmap']})"
                 )
+                if rc2.button("📌", key=f"pin_{r['restaurant_id']}",
+                              help=f"Day{pin_day} {_SLOT_KO_RANK[pin_slot]}에 이 식당을 고정"):
+                    draft = dict(ss.draft or {})
+                    if not draft.get("pref"):
+                        draft["pref"] = pref_sel   # 계약이 비어 있으면 탐색 중인 지역으로 시작
+                    locked = [l for l in (draft.get("locked") or [])
+                              if not (isinstance(l, dict) and str(l.get("slot") or "") == pin_slot
+                                      and str(l.get("day") or "") in (str(pin_day), str(int(pin_day))))]
+                    locked.append({"day": int(pin_day), "slot": pin_slot, "name": r["name"],
+                                   "note": "[사용자 확인: 랭킹 탐색에서 직접 지정]"})
+                    draft["locked"] = locked
+                    ss.draft = draft
+                    ss.ready = TripContract.from_dict(draft).is_ready()
+                    ss.pin_done = (f"📌 Day{pin_day} {_SLOT_KO_RANK[pin_slot]} 고정: {r['name']} — "
+                                   "'💬 여행 계획' 탭에서 일정을 (재)생성하면 반영돼요."
+                                   + ("" if ss.ready else " (지역·날짜를 채팅으로 알려주시면 생성 버튼이 열려요)"))
+                    _persist_session()
+                    st.rerun()
