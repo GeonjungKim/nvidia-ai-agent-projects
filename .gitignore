@@ -26,10 +26,14 @@ Tabelog_Recommendation/.git-backup/
 # 로컬 도구 설정 (Claude Code)
 .claude/
 
-# OS / IDE
+# OS / IDE / Frontend
 .DS_Store
 Thumbs.db
 node_modules/
+.next/
 *.log
 .idea/
 .vscode/
+
+# 스크래핑 코드 및 기타 프로젝트 제외
+Tabelog_Scrapper/
