@@ -61,7 +61,7 @@ async def run_critic(
     )
     out, _ev = await run_tool_agent(
         name="@critic", server=tabelog_mcp, system=SYSTEM, task=task,
-        allow={"get_restaurant"}, max_steps=14, log=log, max_tokens=900,
+        allow={"get_restaurant"}, max_steps=20, log=log, max_tokens=1200,
     )
     data = extract_json(out)
     if not data or "pass" not in data:

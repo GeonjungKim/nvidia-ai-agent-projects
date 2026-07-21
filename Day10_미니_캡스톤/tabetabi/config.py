@@ -78,20 +78,43 @@ NIM_BASE_URL = conf("NIM_BASE_URL") or "https://integrate.api.nvidia.com/v1"
 DEFAULT_MODEL = conf("LLM_MODEL") or "qwen/qwen3-next-80b-a3b-instruct"
 TAVILY_API_KEY = conf("TAVILY_API_KEY")
 
+# 보조 LLM 제공자 (NIM 장애 대비 이원화) — OpenAI 호환 엔드포인트라면 무엇이든.
+# 예: 회사 제공 mlapi.run(gpt-5-mini) — NIM과 다른 인프라라 NIM 장애의 영향을 받지 않고,
+# OpenAI 계열이라 병렬 tool call도 지원한다(NIM llama 폴백이 막혔던 지점). .env에 설정:
+#   FALLBACK_BASE_URL=https://.../v1  FALLBACK_API_KEY=...  FALLBACK_MODEL=openai/gpt-5-mini
+FALLBACK_BASE_URL = conf("FALLBACK_BASE_URL")
+FALLBACK_API_KEY = conf("FALLBACK_API_KEY")
+FALLBACK_MODEL = conf("FALLBACK_MODEL") or ("openai/gpt-5-mini" if FALLBACK_BASE_URL else "")
+
 # qwen thinking 모드 비활성 (Day7 검증: 토큰 폭주 방지)
 NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 
+_LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "120"))
 _llm = None
+_fallback_llm = None
 
 
 def get_llm():
-    """AsyncOpenAI 클라이언트 (NVIDIA NIM). 전역 1개 재사용."""
+    """기본 LLM 클라이언트 (NVIDIA NIM). 전역 1개 재사용.
+
+    timeout: NIM 장애 시 응답이 무기한 안 오는 행(hang) 상태가 관측됨 — 120초에서 끊어
+    APITimeoutError(→ APIConnectionError)로 만들고 루프의 빠른 실패 → 모델 폴백에 태운다.
+    """
     global _llm
     if _llm is None:
         from openai import AsyncOpenAI
-        # timeout: NIM 장애 시 응답이 무기한 안 오는 행(hang) 상태가 관측됨 — 120초에서 끊어
-        # APITimeoutError(→ APIConnectionError)로 만들고 루프의 빠른 실패 → 모델 폴백에 태운다.
-        # (단일 LLM 완성은 max_tokens 6000이어도 120초면 충분 — 그보다 길면 사실상 행)
         _llm = AsyncOpenAI(base_url=NIM_BASE_URL, api_key=NVIDIA_API_KEY,
-                           timeout=float(os.getenv("LLM_TIMEOUT", "120")), max_retries=0)
+                           timeout=_LLM_TIMEOUT, max_retries=0)
     return _llm
+
+
+def get_fallback_llm():
+    """보조 제공자 클라이언트 (미설정이면 None)."""
+    global _fallback_llm
+    if not (FALLBACK_BASE_URL and FALLBACK_API_KEY):
+        return None
+    if _fallback_llm is None:
+        from openai import AsyncOpenAI
+        _fallback_llm = AsyncOpenAI(base_url=FALLBACK_BASE_URL, api_key=FALLBACK_API_KEY,
+                                    timeout=_LLM_TIMEOUT, max_retries=0)
+    return _fallback_llm

@@ -14,7 +14,8 @@ import json
 from fastmcp import Client
 from openai import APIConnectionError, APIStatusError, RateLimitError
 
-from tabetabi.config import DEFAULT_MODEL, NO_THINK, get_llm
+from tabetabi.config import (DEFAULT_MODEL, FALLBACK_MODEL, NO_THINK,
+                             get_fallback_llm, get_llm)
 
 _model_cache: dict = {"id": None}
 
@@ -45,13 +46,28 @@ def _transient_status(e: APIStatusError) -> bool:
     return e.status_code == 400 and "DEGRADED" in str(e)
 
 
-# 기본 모델이 장애(502/DEGRADED/행)로 재시도까지 소진되면 갈아탈 폴백 모델 체인.
-# NIM 무료 티어에서 tool calling을 지원하는 대형 모델을 기본값으로 둔다.
+# 기본 모델이 장애(502/DEGRADED/행)로 재시도까지 소진되면 갈아탈 폴백 모델 체인 (순서대로 시도).
+# 1순위: 보조 제공자(FALLBACK_MODEL, 예 gpt-5-mini) — 다른 인프라 + 병렬 tool 지원.
+# 2순위: NIM llama-3.3-70b — 병렬 tool 불가라 비-tool 호출의 최후 수단.
 import os as _os
 
-FALLBACK_MODELS = [m.strip() for m in
-                   _os.getenv("LLM_FALLBACK_MODELS", "meta/llama-3.3-70b-instruct").split(",") if m.strip()]
+_env_fb = _os.getenv("LLM_FALLBACK_MODELS", "").strip()
+if _env_fb:
+    FALLBACK_MODELS = [m.strip() for m in _env_fb.split(",") if m.strip()]
+else:
+    FALLBACK_MODELS = ([FALLBACK_MODEL] if FALLBACK_MODEL else []) + ["meta/llama-3.3-70b-instruct"]
 _failed_models: set[str] = set()
+
+
+def _client_for(model: str):
+    """모델 → 담당 클라이언트. 보조 제공자 모델이면 보조 클라이언트, 아니면 NIM."""
+    if model and model == FALLBACK_MODEL:
+        return get_fallback_llm() or get_llm()
+    return get_llm()
+
+
+def _is_gpt5(model: str) -> bool:
+    return "gpt-5" in str(model)
 
 
 def _next_fallback(model: str | None) -> str | None:
@@ -65,10 +81,23 @@ def _next_fallback(model: str | None) -> str | None:
 
 
 def _model_kwargs(kw: dict) -> dict:
-    """모델별 인자 정리 — NO_THINK(chat_template_kwargs)는 qwen 전용이라 타 모델에선 뺀다 (400 방지)."""
-    if not str(kw.get("model", "")).startswith("qwen"):
-        return {k: v for k, v in kw.items() if k != "extra_body"}
-    return kw
+    """모델 계열별 인자 어댑터 — 같은 코드로 여러 제공자를 호출하기 위한 정규화.
+
+    - qwen: extra_body(NO_THINK) 유지.
+    - gpt-5 계열: temperature 미지원 → 제거, max_tokens → max_completion_tokens,
+      reasoning_effort=minimal(추론 토큰 최소화 → 빠르고 출력 예산 확보), extra_body 제거.
+    - 그 외(llama 등): extra_body만 제거.
+    """
+    model = str(kw.get("model", ""))
+    if model.startswith("qwen"):
+        return kw
+    out = {k: v for k, v in kw.items() if k != "extra_body"}
+    if _is_gpt5(model):
+        out.pop("temperature", None)
+        if "max_tokens" in out:
+            out["max_completion_tokens"] = out.pop("max_tokens")
+        out.setdefault("reasoning_effort", "minimal")
+    return out
 
 
 def _should_fallback(e: Exception) -> bool:
@@ -88,7 +117,7 @@ async def _try_seq(kw, delays):
         if delay:
             await asyncio.sleep(delay)
         try:
-            return await get_llm().chat.completions.create(**_model_kwargs(kw))
+            return await _client_for(kw.get("model", "")).chat.completions.create(**_model_kwargs(kw))
         except (RateLimitError, APIStatusError, APIConnectionError) as e:
             # 404는 같은 모델을 재시도해도 소용없다 — 즉시 빠져나가 폴백에 맡긴다
             if isinstance(e, APIStatusError) and e.status_code == 404:
@@ -118,11 +147,13 @@ async def _create(**kw):
         fb = _next_fallback(kw.get("model"))
         if not fb:
             raise
-        # tool 호출에서 폴백 모델로 전환하면 성공해도 캐시에 고정하지 않는다 — 병렬 tool
-        # 비호환으로 다음 tool 단계가 깨질 수 있으니, 각 단계가 기본 모델을 다시 시도하게 둔다.
-        if not is_tool_call:
+        res = await _try_seq({**kw, "model": fb}, delays=(0, 4, 12))
+        # 폴백 성공 → 이후 단계도 이 모델을 쓰게 캐시에 고정한다. 단, 병렬 tool을 못 하는
+        # 모델(llama)로 tool 호출을 넘긴 경우엔 고정하지 않는다 — 다음 tool 단계가 깨질 수 있으니
+        # 각 단계가 기본 모델(또는 병렬 가능한 상위 폴백)을 다시 시도하게 둔다.
+        if not (is_tool_call and "llama" in fb):
             _model_cache["id"] = fb
-        return await _try_seq({**kw, "model": fb}, delays=(0, 4, 12))
+        return res
 
 
 def to_openai_tools(mcp_tools) -> list[dict]:
@@ -163,7 +194,7 @@ async def stream_chat(system: str, user: str, *, temperature: float = 0.2, max_t
             if delay:
                 await asyncio.sleep(delay)
             try:
-                stream = await get_llm().chat.completions.create(**_model_kwargs(dict(
+                stream = await _client_for(attempt_model).chat.completions.create(**_model_kwargs(dict(
                     model=attempt_model, temperature=temperature, max_tokens=max_tokens,
                     messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
                     extra_body=NO_THINK, stream=True,
