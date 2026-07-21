@@ -109,6 +109,7 @@ def search_restaurants(
     station: str | None = None,
     keyword: str | None = None,
     max_dinner_budget: int | None = None,
+    max_lunch_budget: int | None = None,
     min_reviews: int | None = None,
     min_bayes: float | None = None,
     sort: str = "bayes",
@@ -143,6 +144,9 @@ def search_restaurants(
     if max_dinner_budget:
         q += " AND r.budget_dinner_floor IS NOT NULL AND r.budget_dinner_floor <= ?"
         params.append(int(max_dinner_budget))
+    if max_lunch_budget:
+        q += " AND r.budget_lunch_floor IS NOT NULL AND r.budget_lunch_floor <= ?"
+        params.append(int(max_lunch_budget))
     if min_reviews:
         q += " AND r.tabelog_review_count >= ?"
         params.append(int(min_reviews))

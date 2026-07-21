@@ -101,6 +101,7 @@ class TripContract:
     origin: str = "서울"                 # 출발 도시 (항공 링크용)
     party: int = 2
     max_dinner_budget: int | None = None   # 저녁 1인 예산 상한 (엔)
+    max_lunch_budget: int | None = None    # 점심 1인 예산 상한 (엔)
     genres_pref: list[str] = field(default_factory=list)
     locked: list[LockedItem] = field(default_factory=list)
     stay_area: str = ""                 # 숙소 앵커 (일본어 역/지명, 예: 駒込) — 1급 시민 (D1)
@@ -181,11 +182,13 @@ class TripContract:
                     name=str(it["name"]),
                     note=str(it.get("note") or ""),
                 ))
-        budget = d.get("max_dinner_budget")
-        try:
-            budget = int(budget) if budget not in (None, "", 0) else None
-        except (ValueError, TypeError):
-            budget = None
+        def _budget(v):
+            try:
+                return int(v) if v not in (None, "", 0) else None
+            except (ValueError, TypeError):
+                return None
+        budget = _budget(d.get("max_dinner_budget"))
+        lunch_budget = _budget(d.get("max_lunch_budget"))
         areas_raw = d.get("areas") or []
         if isinstance(areas_raw, str):          # LLM이 배열 대신 문자열을 주는 경우 방어
             areas_raw = [areas_raw]
@@ -214,6 +217,7 @@ class TripContract:
             origin=str(d.get("origin") or "서울"),
             party=int(d.get("party") or 2),
             max_dinner_budget=budget,
+            max_lunch_budget=lunch_budget,
             genres_pref=[normalize_genre(g) for g in (d.get("genres_pref") or []) if g],
             locked=locked,
             stay_area=stay_area,
@@ -245,6 +249,8 @@ class TripContract:
             lines.append("✈️ **항공 시간(현지)** " + " · ".join(seg))
         else:
             lines.append("✈️ **항공 시간** 미정 — 첫날 낮 도착·마지막날 오후 출발 가정으로 일정 구성")
+        if self.max_lunch_budget:
+            lines.append(f"**점심 예산** 1인 ~¥{self.max_lunch_budget:,}")
         if self.max_dinner_budget:
             lines.append(f"**저녁 예산** 1인 ~¥{self.max_dinner_budget:,}")
         if self.genres_pref:

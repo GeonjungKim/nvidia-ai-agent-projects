@@ -20,6 +20,7 @@ from tabetabi.anchors import resolve_anchor
 from tabetabi.config import DEFAULT_MODEL, TAVILY_API_KEY
 from tabetabi.contract import MAX_TRIP_DAYS, TripContract
 from tabetabi.i18n import DEFAULT_LANG, LANGS, t_area, t_genre, t_genres, t_station
+from tabetabi.mapview import build_map
 from tabetabi.render import itinerary_md, map_points
 from tabetabi.tools.tabelog_server import db_stats, list_areas, list_genres, pref_codes, search_lib
 
@@ -89,10 +90,7 @@ if "msgs" not in ss:
         ss.draft = {}
         ss.ready = False
         ss.itinerary = None
-    ss.map_df = None
-    if ss.itinerary:
-        pts = map_points(ss.itinerary)
-        ss.map_df = pd.DataFrame(pts)[["lat", "lon"]] if pts else None
+    ss.map_pts = map_points(ss.itinerary) if ss.itinerary else None
     ss.logs = []
 
 
@@ -106,7 +104,7 @@ def _persist_session() -> None:
 
 def _reset_view_state() -> None:
     """세션 전환·삭제 시 화면 상태를 비운다 — 다음 rerun에서 DB 기준으로 다시 로드된다."""
-    for k in ("msgs", "draft", "ready", "itinerary", "map_df", "logs"):
+    for k in ("msgs", "draft", "ready", "itinerary", "map_pts", "logs"):
         ss.pop(k, None)
 
 
@@ -213,6 +211,18 @@ with st.sidebar:
         if st.button("🔐 Google로 로그인", use_container_width=True):
             st.login()
 
+# 탭 바를 스크롤해도 상단에 고정(sticky) — 긴 일정에서도 탭 전환이 항상 손 닿는 곳에
+st.markdown("""
+<style>
+div[data-testid="stTabs"] div[data-baseweb="tab-list"] {
+    position: sticky; top: 2.875rem; z-index: 999;
+    background: var(--background-color, #fff);
+    backdrop-filter: blur(4px);
+    padding-top: 0.25rem; border-bottom: 1px solid rgba(128,128,128,0.2);
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ---------- 탭: 대화 / 지역 랭킹 탐색 (D8) ----------
 tab_chat, tab_rank = st.tabs(["💬 여행 계획", "📃 지역 랭킹 탐색"])
 
@@ -222,9 +232,14 @@ with tab_chat:
         with st.chat_message(m["role"], avatar="🍜" if m["role"] == "assistant" else None):
             st.markdown(m["content"])
 
-    if ss.map_df is not None and len(ss.map_df):
-        st.caption("📍 추천 식당 위치 (최인접 역 기준)")
-        st.map(ss.map_df)
+    if ss.get("map_pts"):
+        st.caption("📍 추천 식당 위치 — 핀을 누르면 타베로그·구글지도 링크가 열려요")
+        _fmap = build_map(ss.map_pts, ss.lang)
+        if _fmap is not None:
+            from streamlit_folium import st_folium
+            st_folium(_fmap, width=None, height=420, returned_objects=[], key="itin_map")
+        else:   # folium 미설치 폴백 — 단순 점 지도
+            st.map(pd.DataFrame([{"lat": p["lat"], "lon": p["lon"]} for p in ss.map_pts]))
     if ss.logs:
         with st.expander(f"🔍 에이전트 실행 로그 ({len(ss.logs)}건)"):
             st.code("\n".join(ss.logs), language=None)
@@ -249,8 +264,7 @@ with tab_chat:
                 ss.itinerary = it
                 ss.logs = logs
                 ss.msgs.append({"role": "assistant", "content": itinerary_md(it, ss.lang)})
-                pts = map_points(it)
-                ss.map_df = pd.DataFrame(pts)[["lat", "lon"]] if pts else None
+                ss.map_pts = map_points(it)
                 _persist_session()
                 st.rerun()
             except Exception:
@@ -262,7 +276,7 @@ with tab_chat:
     if ss.itinerary is not None:
         if st.button("♻️ 조건을 바꿔 다시 생성 (대화로 조건 수정 후 클릭)", use_container_width=True):
             ss.itinerary = None
-            ss.map_df = None
+            ss.map_pts = None
             st.rerun()
 
         # 슬롯 즉시 교체 — 파이프라인이 계산해 둔 대안/제안으로 LLM 재호출 없이 바로 바꾼다
@@ -313,8 +327,7 @@ with tab_chat:
                                 if ss.msgs[i]["role"] == "assistant" and str(ss.msgs[i]["content"]).startswith("## 🗾"):
                                     ss.msgs[i]["content"] = itinerary_md(new_it, ss.lang)
                                     break
-                            pts = map_points(new_it)
-                            ss.map_df = pd.DataFrame(pts)[["lat", "lon"]] if pts else None
+                            ss.map_pts = map_points(new_it)
                             _persist_session()
                             st.rerun()
                 st.caption("🔒 고정 슬롯은 계약이라 제외됩니다. 여기 없는 식당은 '📃 지역 랭킹 탐색' 탭에서 📌로 고정한 뒤 재생성하세요.")

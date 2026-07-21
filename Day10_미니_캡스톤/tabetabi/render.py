@@ -219,10 +219,29 @@ def itinerary_md(it: dict, lang: str = "ko") -> str:
 
 
 def map_points(it: dict) -> list[dict]:
+    """지도 핀 데이터 — 좌표 + 식당 링크(타베로그·구글지도)·평점·역·일차.
+
+    route.points의 좌표에, 같은 이름의 식사 카드에서 링크·평점을 조인한다.
+    클릭 가능한 핀(folium 팝업)이 식당 상세로 바로 이동할 수 있게 한다.
+    """
+    # 이름 → 식사 카드 상세 (링크·평점·슬롯) 인덱스
+    meal_by_name: dict[str, dict] = {}
+    for d in it.get("days", []):
+        for m in d.get("meals", []):
+            meal_by_name.setdefault(m.get("name", ""), {**m, "day": d.get("day")})
     pts, seen = [], set()
     for d in it.get("days", []):
         for p in (d.get("route") or {}).get("points", []):
-            if p["name"] not in seen:
-                seen.add(p["name"])
-                pts.append(p)
+            name = p["name"]
+            if name in seen:
+                continue
+            seen.add(name)
+            m = meal_by_name.get(name, {})
+            pts.append({
+                "name": name, "lat": p["lat"], "lon": p["lon"],
+                "day": m.get("day"), "slot": m.get("slot", ""),
+                "tabelog_url": m.get("tabelog_url", ""), "gmap": m.get("gmap", ""),
+                "rating": m.get("rating"), "station": m.get("station", ""),
+                "genres": m.get("genres", ""),
+            })
     return pts

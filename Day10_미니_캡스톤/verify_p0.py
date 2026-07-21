@@ -166,7 +166,7 @@ foodie_data = {"slots": [
         {"restaurant_id": "r3", "name": "新宿ラーメン横丁"},
     ]},
 ]}
-san = concierge._sanitize_foodie(foodie_data, log=lambda s: None)
+san = concierge._sanitize_foodie(foodie_data, c1, log=lambda s: None)
 din_ids = [c["restaurant_id"] for c in san["slots"][0]["candidates"]]
 lun_ids = [c["restaurant_id"] for c in san["slots"][1]["candidates"]]
 check("D5", "_sanitize_foodie: 저녁 후보에서 저품질 코로케 제거", "r4" not in din_ids and "r1" in din_ids, str(din_ids))

@@ -48,7 +48,8 @@ def _pref_hint() -> str:
 
 
 CONCIERGE_SYSTEM = """너는 'TabeTabi' 미식 여행 컨시어지다. 사용자와 한국어로 대화하며 여행 계약(contract)을 완성한다.
-- 필수: pref(지역 코드), start_date/end_date(YYYY-MM-DD). 선택: areas(세부지역, 일본어 지명), stay_area(숙소역), day_anchors, theme_park, origin(출발 도시), party(인원), max_dinner_budget(엔, 숫자), genres_pref(일본어 장르), arrival_time/departure_time(HH:MM), locked, notes.
+- 필수: pref(지역 코드), start_date/end_date(YYYY-MM-DD). 선택: areas(세부지역, 일본어 지명), stay_area(숙소역), day_anchors, theme_park, origin(출발 도시), party(인원), max_dinner_budget(저녁 1인 예산, 엔 숫자), max_lunch_budget(점심 1인 예산, 엔 숫자), genres_pref(일본어 장르), arrival_time/departure_time(HH:MM), locked, notes.
+- **예산**: "점심 2000엔"은 max_lunch_budget:2000, "저녁 4000엔 이하"는 max_dinner_budget:4000 처럼 각각 넣는다. 코드가 이 상한을 강제하니 반드시 숫자로 채운다.
 - **항공 시간**: 첫날 현지 도착 시각은 arrival_time, 마지막날 귀국편 출발 시각은 departure_time에 HH:MM으로 넣는다. "아침 비행기로 도착"→"10:00", "밤 9시 출발 귀국편"→"21:00"처럼 대략값도 좋다. 언급이 없으면 비워둔다 (일정은 기본 가정으로 만들어진다 — 굳이 캐묻지 마라).
 - 사용자가 언급한 '고정' 식당·장소·일정은 반드시 locked 배열에 넣는다: {"day": 1부터(미정 0), "slot": "lunch|dinner|activity|stay", "name": "...", "note": "..."}. 이건 절대 바꾸면 안 되는 약속이다.
 - **숙소**: "○○역 쪽에서 묵을 예정"·"○○에 숙소" 같은 말은 stay_area(일본어 역/지명)에 넣는다. notes에만 남기지 마라. 예: "고마고메역 쪽" → stay_area:"駒込". (locked의 stay 슬롯으로 들어와도 stay_area로 승격된다.)
@@ -356,8 +357,28 @@ def _is_takeout_dinner(row: dict) -> bool:
     return False
 
 
-def _sanitize_foodie(foodie_data: dict, log) -> dict:
-    """후보에 DB 장르를 붙이고, 카페 오배치·품질 하한 미달·저녁 테이크아웃 후보를 코드로 걸러낸다 (D5)."""
+def _budget_cap(contract: TripContract, slot: str) -> int | None:
+    """슬롯별 예산 상한 (엔). cafe는 점심 예산에 준한다."""
+    if slot == "dinner":
+        return contract.max_dinner_budget
+    return contract.max_lunch_budget   # lunch·cafe
+
+
+def _over_budget(row: dict, slot: str, contract: TripContract) -> int | None:
+    """예산 초과면 그 하한가(엔)를 반환, 아니면 None. 코드가 강제하는 결정론 게이트 —
+    LLM(@foodie)이 예산 인자를 빠뜨려도 초과 식당이 최종 일정에 남지 않게 한다 (실사례: 4,000엔
+    저녁 설정인데 40,000엔 스시가 추천됨). 가격 정보가 없는(floor=None) 곳은 판정 보류(통과)."""
+    cap = _budget_cap(contract, slot)
+    if not cap:
+        return None
+    floor = row.get("budget_dinner_floor") if slot == "dinner" else row.get("budget_lunch_floor")
+    if floor is not None and floor > cap:
+        return floor
+    return None
+
+
+def _sanitize_foodie(foodie_data: dict, contract: TripContract, log) -> dict:
+    """후보에 DB 장르를 붙이고, 카페 오배치·품질 하한 미달·저녁 테이크아웃·예산 초과 후보를 코드로 걸러낸다 (D5)."""
     ids = [str(c.get("restaurant_id")) for s in foodie_data.get("slots", [])
            for c in (s.get("candidates") or []) if c.get("restaurant_id")]
     rows = fetch_by_ids(ids)
@@ -377,6 +398,10 @@ def _sanitize_foodie(foodie_data: dict, log) -> dict:
                     continue
                 if slot == "dinner" and _is_takeout_dinner(r):
                     log(f"[정제] {s.get('day')}일차 저녁: 테이크아웃/반찬 업태 제외 ({r['name']})")
+                    continue
+                over = _over_budget(r, slot, contract)
+                if over:
+                    log(f"[정제] {s.get('day')}일차 {slot}: 예산 초과 제외 ({r['name']} · 하한 ¥{over:,} > 상한 ¥{_budget_cap(contract, slot):,})")
                     continue
             kept.append(c)
         s["candidates"] = kept
@@ -486,7 +511,8 @@ def _backfill(picks: list[dict], contract: TripContract, anchor_keys: dict[int, 
                 continue
             if meal_times is not None and slot not in meal_times.get(day, {}):
                 continue   # 시간창 밖 슬롯 — 백필 금지 (항공 시간 반영)
-            budget = contract.max_dinner_budget if slot == "dinner" else None
+            budget_kw = ({"max_dinner_budget": contract.max_dinner_budget} if slot == "dinner"
+                         else {"max_lunch_budget": contract.max_lunch_budget})  # cafe도 점심 예산 준용
             genre = "カフェ" if slot == "cafe" else genres[(day + i) % len(genres)]
             taken = day_genres.get(day, set())
             cand, relaxed = None, False
@@ -495,7 +521,7 @@ def _backfill(picks: list[dict], contract: TripContract, anchor_keys: dict[int, 
                 min_rv = QUALITY_RELAX_REVIEWS if relax else QUALITY_MIN_REVIEWS
                 min_bs = QUALITY_RELAX_BAYES if relax else QUALITY_MIN_BAYES
                 for kw in ({**anchor_kw, "genre": genre}, {**anchor_kw}, {"genre": genre}, {}):
-                    rows = search_lib(pref=contract.pref, max_dinner_budget=budget,
+                    rows = search_lib(pref=contract.pref, **budget_kw,
                                       min_reviews=min_rv, min_bayes=min_bs, sort="bayes", limit=12,
                                       **{k: v for k, v in kw.items() if v})
                     ok = [r for r in rows if r["restaurant_id"] not in used
@@ -659,7 +685,7 @@ async def run_pipeline(contract: TripContract, log=None, on_partial=None) -> dic
         else:                               # 모든 식사가 고정된 극단 케이스
             foodie_data = {"slots": []}
         log(f"[배치1] @foodie 완료 — 식당 후보 슬롯 {len(foodie_data.get('slots', []))}개")
-        foodie_data = _sanitize_foodie(foodie_data, log)
+        foodie_data = _sanitize_foodie(foodie_data, contract, log)
 
         log("[병합] @concierge 슬롯별 최종 선정 (후보 밖 선택은 코드가 교정)")
         merged = await _merge(contract, foodie_data,
