@@ -46,6 +46,7 @@ git push -u origin main
 ```toml
 NVIDIA_API_KEY = "nvapi-..."
 TAVILY_API_KEY = "tvly-..."
+GOOGLE_MAPS_API_KEY = "..."       # 선택 — DB 미등록 장소 지도 핀 검증 (없으면 링크 폴백)
 TABELOG_DIR = "Tabelog_Recommendation"
 ```
 

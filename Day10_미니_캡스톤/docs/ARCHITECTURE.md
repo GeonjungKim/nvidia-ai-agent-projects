@@ -12,19 +12,20 @@ flowchart TD
 
     subgraph PIPE["run_pipeline() — concierge.py"]
         direction TB
-        LOCK["계약 고정<br/>locked 식당은 코드가 DB 조회로 확정<br/>(LLM 불개입)"]
-        MERGE["병합 (도구 없는 LLM)<br/>후보 밖 선택·중복은 코드가 교정<br/>누락 슬롯은 결정론 백필"]
-        LOGI["로지스틱스 (결정론 코드)<br/>동선 NN 정렬 · 경유지 지도 URL<br/>항공/숙소 딥링크"]
+        LOCK["계약 고정 + Day Window<br/>locked 식당은 코드가 다단계 매칭으로 확정<br/>(DB → 웹 조인 → 증거 카드 확인)<br/>항공 시간 → 하루 시간창·슬롯 계획 (결정론)"]
+        MERGE["병합 (도구 없는 LLM)<br/>후보 밖 선택·중복은 코드가 교정<br/>누락 슬롯은 결정론 백필<br/>⚡ 완료 즉시 잠정 라인업 UI 표시"]
+        LOGI["로지스틱스 (결정론 코드)<br/>동선 NN 정렬 · 경유지 지도 URL<br/>휴무↔방문 요일 대조 · 항공/숙소 딥링크"]
     end
 
     C --> LOCK
-    LOCK -->|"배치1: asyncio.gather 병렬"| F["🍜 @foodie<br/>열린 슬롯 식당 후보<br/>(슬롯당 2곳)"]
-    LOCK -->|"배치1: asyncio.gather 병렬"| S["🔭 @scout<br/>활동·날씨·호텔·항공 시세"]
+    LOCK -->|"배치1: @scout은 백그라운드 태스크"| S["🔭 @scout<br/>활동·날씨·호텔·항공 시세"]
+    LOCK -->|"배치1: 먼저 완주"| F["🍜 @foodie<br/>열린 슬롯 식당 후보<br/>(슬롯당 2곳)"]
     F --> MERGE
-    S --> MERGE
+    S -->|"완료 시 합류 (활동·evidence)"| CR
     MERGE --> CR["⚖️ @critic<br/>읽기 전용 검증 게이트<br/>불합격 시 병합 1회 재시도"]
     CR --> LOGI
     LOGI --> UI
+    LOGI -.->|"DB 미등록 장소 (선택 기능)"| PL["Google Places API<br/>정식 명칭·주소·핀 확정 링크<br/>(키 없으면 링크 폴백)"]
 
     F <-->|"search_restaurants<br/>list_areas · list_genres"| DB[("Tabelog DB MCP 서버<br/>SQLite · 유니크 식당 45,725곳<br/>읽기 전용 URI")]
     CR <-->|"get_restaurant (단 1개)"| DB
@@ -59,22 +60,29 @@ sequenceDiagram
     Note over U,C: 필수 정보(지역·날짜)가 모일 때까지 멀티턴 반복 → ready=true
 
     U->>UI: [일정 생성] 버튼
-    UI->>C: run_pipeline(contract)
-    C->>DB: 고정(locked) 식당 코드 확정 (4단계 매칭)
+    UI->>C: run_pipeline(contract, on_partial)
+    C->>C: Day Window 계산 — 항공 시간 → 하루 시간창·식사/활동 슬롯 계획 (결정론)
+    C->>DB: 고정(locked) 식당 코드 확정 (다단계: DB 정확/토큰/가나 유사도 → 웹 조인)
+    opt 이름이 DB에 없을 때
+        C->>WS: 웹검색 — 타베로그 URL 추출 → 자체 DB 조인 (유사도 가드로 오확정 방지)
+    end
 
-    par 배치1 — asyncio.gather 병렬
+    par 배치1 — @scout은 백그라운드 태스크로 계속 실행
+        C->>S: 활동·날씨·호텔·항공 리서치 (백그라운드)
+        S->>WS: web_search (≤9회)
+        WS-->>S: 스니펫 + URL
+    and 먼저 완주하는 트랙 — 식당
         C->>F: 열린 슬롯 후보 요청
         F->>DB: search_restaurants (병렬 tool call)
         DB-->>F: 후보 (id·평점·예산·역·링크)
         F-->>C: 슬롯별 후보 2곳 JSON
-    and
-        C->>S: 활동·날씨·호텔·항공 리서치
-        S->>WS: web_search (≤9회)
-        WS-->>S: 스니펫 + URL
-        S-->>C: 활동/날씨/호텔/항공 JSON + evidence
+        C->>C: 병합 (도구 없는 LLM) → 코드 교정·백필
+        C-->>UI: ⚡ on_partial("meals") — 식당 라인업 잠정 표시 (실측 45s)
     end
 
-    C->>C: 병합 (도구 없는 LLM) → 코드 교정·백필
+    S-->>C: 활동/날씨/호텔/항공 JSON + evidence (합류)
+    C->>C: 활동 시간창 배치 (timemodel)
+    C-->>UI: ⚡ on_partial("activities") — 활동 포함 잠정 표시
     C->>CR: 식당 + 활동 + 항공 기준선 검증 요청 (evidence 첨부)
     CR->>DB: get_restaurant (유령 id·계약 위반 검사)
     CR-->>C: {"pass": bool, "issues": [...]}
@@ -115,11 +123,17 @@ classDiagram
     }
     class concierge_py["agents/concierge.py"] {
         +concierge_reply()
-        +run_pipeline(contract) itinerary
+        +run_pipeline(contract, on_partial) itinerary
+        +swap_meal() LLM 없는 슬롯 교체
         -_resolve_locked() 코드 확정
         -_merge() 도구 없는 LLM
         -_picks_from() 코드 교정
         -_backfill() 결정론 백필
+        -_partial_md() 잠정 라인업
+    }
+    class places_py["places.py (선택)"] {
+        +places_resolve() 정식 명칭·핀 확정
+        키 없으면 None — 링크 폴백
     }
     class loop_py["agents/loop.py"] {
         +run_tool_agent(server, allow, ...)
@@ -141,15 +155,17 @@ classDiagram
     class detlib["결정론 라이브러리<br/>anchors · geo · links<br/>timemodel · resolve · render"] {
         +앵커 해석 · NN 동선 정렬
         +지도/항공/숙소 딥링크
-        +활동 시간표 배치 · 렌더링
+        +Day Window · 활동 시간표 배치
+        +다단계 장소 매칭(웹 조인 포함) · 렌더링
     }
 
     ui_py --> ConciergeTurn
     ui_py --> concierge_py : run_pipeline
     ConciergeTurn --> loop_py : stream_chat
     concierge_py --> TripContract
-    concierge_py --> foodie_py : 배치1 병렬
-    concierge_py --> scout_py : 배치1 병렬
+    concierge_py --> foodie_py : 배치1 (먼저 완주)
+    concierge_py --> scout_py : 배치1 (백그라운드)
+    concierge_py --> places_py : external 장소 검증
     concierge_py --> critic_py : 게이트
     concierge_py --> detlib
     foodie_py --> loop_py : run_tool_agent
