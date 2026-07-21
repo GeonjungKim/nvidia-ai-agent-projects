@@ -5,27 +5,47 @@
 """
 from __future__ import annotations
 
-SLOT_KO = {"lunch": "점심", "cafe": "카페", "dinner": "저녁"}
+from tabetabi.i18n import norm_lang, t_area, t_closed, t_genres, t_station
+
+# 슬롯 라벨 다국어 (유한·고빈도라 정적 사전)
+SLOT_LABEL = {
+    "lunch": {"ko": "점심", "ja": "昼食", "en": "Lunch"},
+    "cafe": {"ko": "카페", "ja": "カフェ", "en": "Cafe"},
+    "dinner": {"ko": "저녁", "ja": "夕食", "en": "Dinner"},
+}
 SLOT_TIME = {"lunch": "12:00", "cafe": "15:00", "dinner": "18:30"}
 SLOT_EMOJI = {"lunch": "🍜", "cafe": "☕", "dinner": "🍣"}
 ACT_SLOT_EMOJI = {"morning": "🌅", "late_afternoon": "🏙️", "evening": "🌃"}
 
+# 카드 안 미세 문구 다국어 (Phase 1 범위: 데이터 카드에 직접 붙는 라벨만)
+_ALT_LABEL = {"ko": "🔀 다른 후보", "ja": "🔀 他の候補", "en": "🔀 Alternatives"}
+_CLOSED_WARN = {
+    "ko": "🚨 **정기휴무 {c} — 방문일과 겹칠 수 있어요!** 예약·방문 전 꼭 확인하세요",
+    "ja": "🚨 **定休日 {c} — 訪問日と重なる可能性!** 予約・訪問前にご確認ください",
+    "en": "🚨 **Closed {c} — may overlap your visit!** Please check before booking",
+}
+_CLOSED_INFO = {"ko": "🗓️ 정기휴무: {c}", "ja": "🗓️ 定休日: {c}", "en": "🗓️ Closed: {c}"}
 
-def _alt_line(alts: list[dict]) -> str:
+
+def _slot_label(slot: str, lang: str) -> str:
+    return SLOT_LABEL.get(slot, {}).get(lang, slot)
+
+
+def _alt_line(alts: list[dict], lang: str = "ko") -> str:
     """대안 후보 1줄 — 카드 안에서 바로 갈아탈 수 있게 (별도 섹션으로 숨기지 않는다)."""
     parts = []
     for a in alts[:3]:
-        station = f" · {a['station']}역" if a.get("station") else ""
+        station = f" · {t_station(a['station'], lang)}" if a.get("station") else ""
         rating = f" ★{a['rating']}" if a.get("rating") else ""
         parts.append(f"[{a['name']}]({a.get('tabelog_url') or a.get('gmap', '')}){rating}{station}")
-    return "  - 🔀 다른 후보: " + " / ".join(parts)
+    return f"  - {_ALT_LABEL[lang]}: " + " / ".join(parts)
 
 
-def _meal_lines(m: dict) -> list[str]:
+def _meal_lines(m: dict, lang: str = "ko") -> list[str]:
     t = m.get("time") or SLOT_TIME.get(m.get("slot"), "")   # 시간창 기반 동적 시각 우선
     emoji = SLOT_EMOJI.get(m.get("slot"), "🍽️")
     lock = "🔒 " if m.get("locked") else ""
-    slot = SLOT_KO.get(m.get("slot"), m.get("slot"))
+    slot = _slot_label(m.get("slot"), lang)
     if m.get("external"):
         web = f" · [🔎 웹 검색]({m['web']})" if m.get("web") else ""
         map_label = "📍 지도" if m.get("pin_verified") else "📍 지도 검색"
@@ -41,7 +61,7 @@ def _meal_lines(m: dict) -> list[str]:
                          "엉뚱한 곳을 보여줄 수 있으니 웹 검색으로 교차 확인하세요.")
         for s in (m.get("suggestions") or [])[:2]:   # 4단계 매칭의 근접 후보 — "혹시 이 곳?"
             rating = f"★{s['rating']}" if s.get("rating") else "★-"
-            station = f" · {s['station']}역" if s.get("station") else ""
+            station = f" · {t_station(s['station'], lang)}" if s.get("station") else ""
             gmap = f" · [📍 지도]({s['gmap']})" if s.get("gmap") else ""
             lines.append(f"  - 🔍 혹시 이 곳 아닌가요? [{s['name']}]({s.get('tabelog_url', '')}) — "
                          f"{rating}{station}{gmap} · 맞다면 채팅에 \"고정 식당을 {s['name']}(으)로 바꿔줘\"라고 말씀해 주세요")
@@ -50,9 +70,9 @@ def _meal_lines(m: dict) -> list[str]:
     reviews = f"{m['reviews']:,}" if m.get("reviews") else "0"
     bayes = f" · 신뢰점수 {m['bayes']}" if m.get("bayes") else ""
     budget = f" · {m['budget']}" if m.get("budget") else ""
-    station = f" · {m['station']}역" if m.get("station") else ""
+    station = f" · {t_station(m['station'], lang)}" if m.get("station") else ""
     lines = [
-        f"- **{t}** {emoji} {lock}**{slot}** · [{m['name']}]({m['tabelog_url']}) — {m.get('genres', '')}"
+        f"- **{t}** {emoji} {lock}**{slot}** · [{m['name']}]({m['tabelog_url']}) — {t_genres(m.get('genres', ''), lang)}"
         f" · {rating}({reviews}){bayes}{budget}{station} · [📍 지도]({m['gmap']})"
     ]
     if m.get("off_anchor"):                       # 앵커 이탈 라벨 강제 표기 (D2, 조용한 이탈 금지)
@@ -61,18 +81,17 @@ def _meal_lines(m: dict) -> list[str]:
         lines.append("  - ⚠️ 데이터 희소 지역 — 품질 기준 완화 적용")
     closed = m.get("closed")
     if closed and "無休" not in closed:           # 정기휴무 표기 + 방문일 겹침 경고 (결정론 대조)
-        if m.get("closed_warn"):
-            lines.append(f"  - 🚨 **정기휴무 {closed} — 방문일과 겹칠 수 있어요!** 예약·방문 전 꼭 확인하세요")
-        else:
-            lines.append(f"  - 🗓️ 정기휴무: {closed}")
+        c = t_closed(closed, lang)
+        tmpl = _CLOSED_WARN[lang] if m.get("closed_warn") else _CLOSED_INFO[lang]
+        lines.append("  - " + tmpl.format(c=c))
     if m.get("reason"):
         lines.append(f"  - _{m['reason']}_")
     if m.get("alternatives"):                     # 대안을 카드 안에 인라인 — 클릭 한 번 거리로 (UX)
-        lines.append(_alt_line(m["alternatives"]))
+        lines.append(_alt_line(m["alternatives"], lang))
     return lines
 
 
-def _activity_lines(a: dict) -> list[str]:
+def _activity_lines(a: dict, lang: str = "ko") -> list[str]:
     """활동 카드 — 슬롯 시각·why + tip 1줄(필수)·영업시간/입장마감(있으면) (D3)."""
     t = a.get("time") or "10:00"
     emoji = ACT_SLOT_EMOJI.get(a.get("slot"), "🎡")
@@ -103,7 +122,8 @@ def _walk_hint(km) -> str:
     return f"전철 권장 (~{km}km)"
 
 
-def itinerary_md(it: dict) -> str:
+def itinerary_md(it: dict, lang: str = "ko") -> str:
+    lang = norm_lang(lang)
     L = ["## 🗾 TabeTabi 여행 일정"]
     s = it.get("stats") or {}
     if s:
@@ -119,7 +139,7 @@ def itinerary_md(it: dict) -> str:
         L.append(f"**🌤️ 날씨** — {it['weather']}")
 
     for d in it.get("days", []):
-        anchor = f" · 🧭 {d['anchor']}" if d.get("anchor") else ""
+        anchor = f" · 🧭 {t_area(d['anchor'], lang)}" if d.get("anchor") else ""
         L.append(f"### Day {d['day']} · {d.get('date', '')}{anchor}")
         if d.get("banner"):                       # 항공 시간 가정/반영 배너 (조용한 가정 금지)
             L.append(f"> {d['banner']}")
@@ -127,9 +147,9 @@ def itinerary_md(it: dict) -> str:
         # 타임라인: 슬롯 시각으로 활동·식사를 한 줄에 정렬 (D3 스케줄 결과 사용)
         entries: list[tuple[str, list[str]]] = []
         for a in (d.get("activities") or []):
-            entries.append((a.get("time") or "10:00", _activity_lines(a)))
+            entries.append((a.get("time") or "10:00", _activity_lines(a, lang)))
         for m in d.get("meals", []):
-            entries.append((m.get("time") or SLOT_TIME.get(m.get("slot"), "23:00"), _meal_lines(m)))
+            entries.append((m.get("time") or SLOT_TIME.get(m.get("slot"), "23:00"), _meal_lines(m, lang)))
         entries.sort(key=lambda e: e[0])
         for _, lines in entries:
             L.extend(lines)

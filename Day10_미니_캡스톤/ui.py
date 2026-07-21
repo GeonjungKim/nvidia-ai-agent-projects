@@ -19,6 +19,7 @@ from tabetabi.agents.concierge import ConciergeTurn, run_pipeline, swap_meal
 from tabetabi.anchors import resolve_anchor
 from tabetabi.config import DEFAULT_MODEL, TAVILY_API_KEY
 from tabetabi.contract import MAX_TRIP_DAYS, TripContract
+from tabetabi.i18n import DEFAULT_LANG, LANGS, t_genre, t_genres, t_station
 from tabetabi.render import itinerary_md, map_points
 from tabetabi.tools.tabelog_server import db_stats, list_areas, list_genres, pref_codes, search_lib
 
@@ -109,10 +110,28 @@ def _reset_view_state() -> None:
         ss.pop(k, None)
 
 
+if "lang" not in ss:
+    ss.lang = DEFAULT_LANG
+
 # ---------- 사이드바 (대화 목록을 최상단에 — ChatGPT/Claude식 내비게이션) ----------
 with st.sidebar:
     st.title("🍜 TabeTabi")
     st.caption("멀티에이전트 미식 여행 컨시어지")
+
+    # 표시 언어 — 장르·역·정기휴무 등 일본어 메타데이터를 선택 언어로 번역해 표시 (LLM 미사용)
+    _lang_labels = list(LANGS.keys())
+    _cur = next((lbl for lbl, code in LANGS.items() if code == ss.lang), _lang_labels[0])
+    _pick = st.radio("🌐 표시 언어 / Language", _lang_labels,
+                     index=_lang_labels.index(_cur), horizontal=True, key="lang_pick")
+    if LANGS[_pick] != ss.lang:
+        ss.lang = LANGS[_pick]
+        # 이미 생성된 일정 메시지를 새 언어로 다시 렌더 (파이프라인 재실행 없이 — 결정론 사전 조회)
+        if ss.get("itinerary"):
+            for i in range(len(ss.msgs) - 1, -1, -1):
+                if ss.msgs[i]["role"] == "assistant" and str(ss.msgs[i]["content"]).startswith("## 🗾"):
+                    ss.msgs[i]["content"] = itinerary_md(ss.itinerary, ss.lang)
+                    break
+        st.rerun()
 
     if st.button("➕ 새 대화", type="primary", use_container_width=True):
         ss.session_id = store.new_session_id()
@@ -229,7 +248,7 @@ with tab_chat:
                     status.update(label="✅ 일정 완성!", state="complete")
                 ss.itinerary = it
                 ss.logs = logs
-                ss.msgs.append({"role": "assistant", "content": itinerary_md(it)})
+                ss.msgs.append({"role": "assistant", "content": itinerary_md(it, ss.lang)})
                 pts = map_points(it)
                 ss.map_df = pd.DataFrame(pts)[["lat", "lon"]] if pts else None
                 _persist_session()
@@ -292,7 +311,7 @@ with tab_chat:
                             ss.itinerary = new_it
                             for i in range(len(ss.msgs) - 1, -1, -1):   # 채팅의 일정 메시지도 갱신
                                 if ss.msgs[i]["role"] == "assistant" and str(ss.msgs[i]["content"]).startswith("## 🗾"):
-                                    ss.msgs[i]["content"] = itinerary_md(new_it)
+                                    ss.msgs[i]["content"] = itinerary_md(new_it, ss.lang)
                                     break
                             pts = map_points(new_it)
                             ss.map_df = pd.DataFrame(pts)[["lat", "lon"]] if pts else None
@@ -383,8 +402,10 @@ with tab_rank:
             genre_rows = []
         genre_options = [g["genre"] for g in genre_rows]
         default_genres = [g for g in contract_draft.genres_pref if g in genre_options]
+        # 값은 일본어 원문(검색 키), 표시만 선택 언어로 번역 (format_func)
         genre_sel = st.multiselect("장르 (복수 선택 가능 — 계약의 선호 장르가 미리 선택돼 있어요)",
-                                   genre_options, default=default_genres, key="rank_genres")
+                                   genre_options, default=default_genres, key="rank_genres",
+                                   format_func=lambda g: t_genre(g, ss.lang))
 
         c1, c2, c3 = st.columns(3)
         budget = c1.number_input("저녁 예산 상한(엔, 0=제한 없음)", min_value=0, step=500,
@@ -432,10 +453,10 @@ with tab_rank:
                 reviews = f"{r['tabelog_review_count']:,}" if r.get("tabelog_review_count") else "0"
                 bayes = f" · 신뢰점수 {r['bayes_score']}" if r.get("bayes_score") else ""
                 budget_txt = f" · 저녁 {r['budget_dinner']}" if r.get("budget_dinner") else ""
-                station = f" · {r['stations'][0]}역" if r.get("stations") else ""
+                station = f" · {t_station(r['stations'][0], ss.lang)}" if r.get("stations") else ""
                 rc1, rc2 = st.columns([12, 1])
                 rc1.markdown(
-                    f"- [{r['name']}]({r['tabelog_url']}) — {r.get('genres', '')} · {rating}({reviews}){bayes}{budget_txt}{station}"
+                    f"- [{r['name']}]({r['tabelog_url']}) — {t_genres(r.get('genres', ''), ss.lang)} · {rating}({reviews}){bayes}{budget_txt}{station}"
                     f" · [📍 지도]({r['gmap']})"
                 )
                 if rc2.button("📌", key=f"pin_{r['restaurant_id']}",
