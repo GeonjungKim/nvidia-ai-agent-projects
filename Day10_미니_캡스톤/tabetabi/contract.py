@@ -224,15 +224,19 @@ class TripContract:
             notes=str(d.get("notes") or ""),
         )
 
-    def summary_md(self) -> str:
-        lines = [f"**지역** `{self.pref or '?'}`  ·  **기간** {self.start_date or '?'} ~ {self.end_date or '?'} ({self.num_days or '?'}일)  ·  **인원** {self.party}명"]
+    def summary_md(self, lang: str = "ko") -> str:
+        # 지역·역·장르를 표시 언어로 번역 (사전 조회, 원문 폴백)
+        from tabetabi.i18n import t_area, t_genre, t_pref
+        _a = lambda s: t_area(s, lang, pref=self.pref)
+        pref_disp = t_pref(self.pref, lang) if self.pref else "?"
+        lines = [f"**지역** {pref_disp}  ·  **기간** {self.start_date or '?'} ~ {self.end_date or '?'} ({self.num_days or '?'}일)  ·  **인원** {self.party}명"]
         if self.areas:
-            lines.append(f"**세부지역 힌트** {', '.join(self.areas)}")
+            lines.append(f"**세부지역 힌트** {', '.join(_a(a) for a in self.areas)}")
         if self.stay_area:
-            lines.append(f"🏨 **숙소 앵커** {self.stay_area} — 호텔은 이 역 기준으로 추천")
+            lines.append(f"🏨 **숙소 앵커** {_a(self.stay_area)} — 호텔은 이 역 기준으로 추천")
         anchors = self.effective_day_anchors()
         if anchors:
-            lines.append("🧭 **일자별 앵커** " + " / ".join(f"Day{d}: {a}" for d, a in sorted(anchors.items())))
+            lines.append("🧭 **일자별 앵커** " + " / ".join(f"Day{d}: {_a(a)}" for d, a in sorted(anchors.items())))
         if self.theme_park:
             lines.append("🎢 **테마파크** 하루 통째 일정 편성 의향 있음")
         if self.arrival_time or self.departure_time:
@@ -244,7 +248,7 @@ class TripContract:
         if self.max_dinner_budget:
             lines.append(f"**저녁 예산** 1인 ~¥{self.max_dinner_budget:,}")
         if self.genres_pref:
-            lines.append(f"**선호 장르** {', '.join(self.genres_pref)}")
+            lines.append(f"**선호 장르** {', '.join(t_genre(g, lang) for g in self.genres_pref)}")
         for lk in self.locked:
             day = f"{lk.day}일차 " if lk.day else ""
             slot = f"{lk.slot} " if lk.slot else ""

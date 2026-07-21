@@ -19,7 +19,7 @@ from tabetabi.agents.concierge import ConciergeTurn, run_pipeline, swap_meal
 from tabetabi.anchors import resolve_anchor
 from tabetabi.config import DEFAULT_MODEL, TAVILY_API_KEY
 from tabetabi.contract import MAX_TRIP_DAYS, TripContract
-from tabetabi.i18n import DEFAULT_LANG, LANGS, t_genre, t_genres, t_station
+from tabetabi.i18n import DEFAULT_LANG, LANGS, t_area, t_genre, t_genres, t_station
 from tabetabi.render import itinerary_md, map_points
 from tabetabi.tools.tabelog_server import db_stats, list_areas, list_genres, pref_codes, search_lib
 
@@ -174,7 +174,7 @@ with st.sidebar:
     st.divider()
     st.subheader("📋 SHARED CONTRACT")
     if ss.draft:
-        st.markdown(TripContract.from_dict(ss.draft).summary_md())
+        st.markdown(TripContract.from_dict(ss.draft).summary_md(ss.lang))
     else:
         st.caption("대화를 시작하면 계약이 여기에 채워집니다.")
     st.divider()
@@ -384,7 +384,10 @@ with tab_rank:
         except Exception:
             db_areas = []
         anchor_pool = list(dict.fromkeys(contract_anchors + db_areas))
-        anchor_choice = st.selectbox("앵커(역/세부지역)", ["(전체)"] + anchor_pool, key="rank_anchor")
+        # 값은 코드/역명(검색 키), 표시만 선택 언어로 번역 (A1301 → '긴자·유라쿠초 일대')
+        anchor_choice = st.selectbox(
+            "앵커(역/세부지역)", ["(전체)"] + anchor_pool, key="rank_anchor",
+            format_func=lambda v: "(전체)" if v == "(전체)" else t_area(v, ss.lang, pref=pref_sel))
         custom_anchor = st.text_input("목록에 없는 역/지명 직접 입력 (일본어 표기 — 예: 中野, 吉祥寺, 恵比寿)",
                                       key="rank_anchor_custom",
                                       help="입력하면 위 선택보다 우선 적용됩니다. 비우면 위 선택을 따라요.")
@@ -394,7 +397,8 @@ with tab_rank:
             if chosen_anchor:
                 info = resolve_anchor(pref_sel, chosen_anchor)
                 anchor_kwargs = info.get("search_kwargs") or {}
-                st.caption(info["log"])
+                # 로그의 원시 코드 대신 번역 지명으로 안내 (UX)
+                st.caption(f"📍 {t_area(chosen_anchor, ss.lang, pref=pref_sel)} · 매칭 {info.get('count', 0):,}곳")
 
             genre_rows = list_genres(pref_sel, anchor_kwargs.get("area2"))
         except Exception:

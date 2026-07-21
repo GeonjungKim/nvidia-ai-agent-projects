@@ -18,9 +18,12 @@ DEFAULT_LANG = "ko"
 # 검증된 라벨 사전·헬퍼를 이전 프로젝트에서 그대로 import (Tabelog_Recommendation).
 # config를 먼저 import해 sys.path에 데이터 폴더가 들어가도록 보장한다 (import 순서 무관하게).
 # 배포/누락 시에도 죽지 않게 항등 함수로 폴백한다 (fail-soft — 최악의 경우 원문 일본어 표시).
+import re
+
 import tabetabi.config  # noqa: F401  (부작용: sys.path에 Tabelog_Recommendation 추가)
 
 try:
+    from app.labels import area_label as _area_label
     from app.labels import genre_label as _genre_label
     from app.labels import pref_label as _pref_label
     from app.labels import station_label as _station_label
@@ -36,6 +39,12 @@ except Exception:      # pragma: no cover - 데이터 폴더 부재 등
 
     def _station_label(name: str, lang: str = "ko") -> str:
         return name
+
+    def _area_label(db, pref: str, code: str, lang: str = "ko") -> str:
+        return code
+
+# 타베로그 세부지역 코드 형태 (예: A1301, A130101) — 지명이 아니라 코드다
+_AREA_CODE_RE = re.compile(r"^A\d{4,6}$")
 
 
 # 역 접미사 (station_label은 역명만 주므로 접미사는 언어별로 붙인다)
@@ -87,8 +96,30 @@ def t_station(name: str, lang: str = "ko", suffix: bool = True) -> str:
     return label + _STATION_SUFFIX[lang] if suffix else label
 
 
-def t_area(name: str, lang: str = "ko") -> str:
-    """앵커/세부지역 표기 — 대개 역명과 같은 어휘라 station 사전을 재사용 (접미사 없음)."""
+from functools import lru_cache
+
+
+@lru_cache(maxsize=1024)
+def _area_code_label(pref: str, code: str, lang: str) -> str:
+    """타베로그 세부지역 코드(A1301) → 대표 역 기반 지명 (예: '신주쿠·... 일대'). DB 조회 → 캐시."""
+    try:
+        from tabetabi.config import DB_PATH
+        return _area_label(str(DB_PATH), pref, code, lang)
+    except Exception:
+        return code
+
+
+def t_area(name: str, lang: str = "ko", pref: str = "") -> str:
+    """앵커/세부지역 표기 번역 (접미사 없음).
+
+    - 타베로그 지역 '코드'(A1301)면 대표 역 기반 지명으로 변환 (area_label).
+    - 그 외(역명·동네 지명)면 station 사전 재사용. 미등록이면 원문 유지.
+    """
+    lang = norm_lang(lang)
+    if not name:
+        return ""
+    if _AREA_CODE_RE.match(name):
+        return _area_code_label(pref, name, lang)
     return t_station(name, lang, suffix=False)
 
 
