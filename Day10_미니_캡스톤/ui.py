@@ -18,7 +18,7 @@ from tabetabi import store
 from tabetabi.agents.concierge import ConciergeTurn, run_pipeline, swap_meal
 from tabetabi.anchors import resolve_anchor
 from tabetabi.config import DEFAULT_MODEL, TAVILY_API_KEY
-from tabetabi.contract import TripContract
+from tabetabi.contract import MAX_TRIP_DAYS, TripContract
 from tabetabi.render import itinerary_md, map_points
 from tabetabi.tools.tabelog_server import db_stats, list_areas, list_genres, pref_codes, search_lib
 
@@ -421,7 +421,7 @@ with tab_rank:
             _SLOT_KO_RANK = {"lunch": "점심", "cafe": "카페", "dinner": "저녁"}
             nd = contract_draft.num_days or 0
             pc1, pc2 = st.columns(2)
-            pin_day = pc1.number_input("고정할 일차 (Day)", min_value=1, max_value=nd if nd else 14,
+            pin_day = pc1.number_input("고정할 일차 (Day)", min_value=1, max_value=nd if nd else MAX_TRIP_DAYS,
                                        value=1, key="pin_day")
             pin_slot = pc2.selectbox("고정할 슬롯", ["lunch", "cafe", "dinner"],
                                      format_func=lambda s: _SLOT_KO_RANK[s], key="pin_slot")

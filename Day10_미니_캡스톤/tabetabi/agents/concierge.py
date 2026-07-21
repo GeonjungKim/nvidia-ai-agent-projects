@@ -21,7 +21,7 @@ from tabetabi.agents.foodie import run_foodie
 from tabetabi.agents.loop import plain_chat, stream_chat
 from tabetabi.agents.scout import run_scout
 from tabetabi.anchors import deviation_km, off_anchor_label, resolve_anchor
-from tabetabi.contract import TripContract, extract_json
+from tabetabi.contract import MAX_TRIP_DAYS, TripContract, extract_json
 from tabetabi.geo import order_day_route
 from tabetabi.links import (city_of, external_place_link, external_web_search_link,
                             flight_links, google_search_url, hotel_links)
@@ -85,7 +85,14 @@ def _finalize_reply(raw: str, draft: dict) -> tuple[str, dict, bool]:
     data = extract_json(rest) or {}
     new_draft = data.get("contract") if isinstance(data.get("contract"), dict) else draft
     # ready 판정은 코드가 한다 — 필수(pref·날짜)가 갖춰지면 생성 버튼을 연다 (모델의 과잉 질문 방지)
-    ready = TripContract.from_dict(new_draft).is_ready()
+    c = TripContract.from_dict(new_draft)
+    ready = c.is_ready()
+    if not ready and c.pref and c.num_days_raw > MAX_TRIP_DAYS:
+        # 조용한 실패 금지: 기간 초과로 버튼이 안 열리는 이유를 반드시 사용자에게 알린다
+        # (실사례: 15일 여행이 구 상한 14일에 걸려 안내 없이 버튼만 사라짐)
+        reply += (f"\n\n⚠️ 한 번에 만들 수 있는 일정은 최대 **{MAX_TRIP_DAYS}일**이에요. "
+                  f"지금 기간은 {c.num_days_raw}일이라 생성 버튼이 열리지 않아요 — "
+                  "기간을 나눠서 (예: \"전반부 8/19~8/25로 먼저 짜줘\") 요청해 주시면 차례로 만들어 드릴게요.")
     if ready:
         pend = pending_lock_confirmations(new_draft)
         if pend:   # D6: 고정 장소 매칭이 불확실(4단계)하면 생성 전에 반드시 확인받는다
@@ -130,7 +137,7 @@ async def concierge_reply(history: list[dict], draft: dict) -> tuple[str, dict, 
     if shortcut:
         return shortcut
     system, user = _concierge_prompt(history, draft)
-    out = await plain_chat(system, user, max_tokens=1000)
+    out = await plain_chat(system, user, max_tokens=2000)
     return _finalize_reply(out, draft)
 
 
@@ -159,7 +166,7 @@ class ConciergeTurn:
         system, user = _concierge_prompt(self.history, self.draft)
         shown = 0
         hold_back = len(_CONTRACT_MARKER) - 1   # 마커가 델타 경계에서 쪼개져 도착할 수 있어 꼬리를 보류
-        async for delta in stream_chat(system, user, max_tokens=1000):
+        async for delta in stream_chat(system, user, max_tokens=2000):
             self._raw += delta
             idx = self._raw.find(_CONTRACT_MARKER)
             if idx != -1:
@@ -200,7 +207,7 @@ async def _merge(contract: TripContract, foodie_data: dict, scout_data: dict,
     )
     if extra_note:
         user += f"\n필수 반영 지적사항: {extra_note}\n"
-    out = await plain_chat(MERGE_SYSTEM, user, max_tokens=800)
+    out = await plain_chat(MERGE_SYSTEM, user, max_tokens=2000)
     return extract_json(out) or {}
 
 

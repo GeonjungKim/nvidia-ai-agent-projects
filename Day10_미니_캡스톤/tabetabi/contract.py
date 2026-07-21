@@ -86,6 +86,12 @@ class LockedItem:
     note: str = ""
 
 
+# 한 번에 생성 가능한 최대 일수. 슬롯 수(일수×3)가 @foodie 후보 수집·병합 JSON 크기를 직접
+# 키우므로 무한정 올릴 수 없다 (30일=90슬롯은 병합 출력이 토큰 한도를 넘는다). 초과 시
+# 조용히 ready=False가 되지 않도록 concierge가 반드시 안내 문구를 낸다 (조용한 실패 금지).
+MAX_TRIP_DAYS = 21
+
+
 @dataclass
 class TripContract:
     pref: str = ""                      # Tabelog 지역 코드 (예: tokyo, osaka)
@@ -105,14 +111,20 @@ class TripContract:
     notes: str = ""
 
     @property
-    def num_days(self) -> int:
+    def num_days_raw(self) -> int:
+        """상한 미적용 일수 — 초과 안내 메시지 판단용 (0=날짜 미정/역순)."""
         try:
             d0 = date.fromisoformat(self.start_date)
             d1 = date.fromisoformat(self.end_date)
         except (ValueError, TypeError):
             return 0
         n = (d1 - d0).days + 1
-        return n if 1 <= n <= 14 else 0
+        return n if n >= 1 else 0
+
+    @property
+    def num_days(self) -> int:
+        n = self.num_days_raw
+        return n if 1 <= n <= MAX_TRIP_DAYS else 0
 
     def date_of(self, day: int) -> str:
         try:

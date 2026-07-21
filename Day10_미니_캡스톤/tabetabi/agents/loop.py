@@ -45,24 +45,84 @@ def _transient_status(e: APIStatusError) -> bool:
     return e.status_code == 400 and "DEGRADED" in str(e)
 
 
-async def _create(**kw):
-    """429·5xx·연결 오류·NIM DEGRADED 재시도 (백오프 3/8/20초)."""
+# 기본 모델이 장애(502/DEGRADED/행)로 재시도까지 소진되면 갈아탈 폴백 모델 체인.
+# NIM 무료 티어에서 tool calling을 지원하는 대형 모델을 기본값으로 둔다.
+import os as _os
+
+FALLBACK_MODELS = [m.strip() for m in
+                   _os.getenv("LLM_FALLBACK_MODELS", "meta/llama-3.3-70b-instruct").split(",") if m.strip()]
+_failed_models: set[str] = set()
+
+
+def _next_fallback(model: str | None) -> str | None:
+    """장애 모델을 기록하고 아직 실패하지 않은 다음 후보를 돌려준다 (없으면 None)."""
+    if model:
+        _failed_models.add(model)
+    for m in [DEFAULT_MODEL] + FALLBACK_MODELS:
+        if m not in _failed_models:
+            return m
+    return None
+
+
+def _model_kwargs(kw: dict) -> dict:
+    """모델별 인자 정리 — NO_THINK(chat_template_kwargs)는 qwen 전용이라 타 모델에선 뺀다 (400 방지)."""
+    if not str(kw.get("model", "")).startswith("qwen"):
+        return {k: v for k, v in kw.items() if k != "extra_body"}
+    return kw
+
+
+def _should_fallback(e: Exception) -> bool:
+    """다른 모델로 갈아탈 상황인가 — 일시 장애(429/5xx/DEGRADED/타임아웃/연결) 또는
+    404(모델·엔드포인트 없음: 설정 모델이 NIM에서 내려간 경우)."""
+    if isinstance(e, (RateLimitError, APIConnectionError)):
+        return True
+    if isinstance(e, APIStatusError):
+        return _transient_status(e) or e.status_code == 404
+    return False
+
+
+async def _try_seq(kw, delays):
+    """한 모델에 대한 재시도 시퀀스 — 재시도 가능한 오류만 백오프, 아니면 즉시 raise."""
     last: Exception | None = None
-    for delay in (0, 3, 8, 20):
+    for i, delay in enumerate(delays):
         if delay:
             await asyncio.sleep(delay)
         try:
-            return await get_llm().chat.completions.create(**kw)
-        except RateLimitError as e:
-            last = e
-        except APIStatusError as e:
-            if _transient_status(e):
-                last = e
-            else:
+            return await get_llm().chat.completions.create(**_model_kwargs(kw))
+        except (RateLimitError, APIStatusError, APIConnectionError) as e:
+            # 404는 같은 모델을 재시도해도 소용없다 — 즉시 빠져나가 폴백에 맡긴다
+            if isinstance(e, APIStatusError) and e.status_code == 404:
                 raise
-        except APIConnectionError as e:
+            if isinstance(e, APIStatusError) and not isinstance(e, RateLimitError) and not _transient_status(e):
+                raise
             last = e
     raise last
+
+
+async def _create(**kw):
+    """재시도 + 모델 폴백. 폴백 성공 시 _model_cache를 갱신해 같은 파이프라인의 남은 단계도
+    폴백 모델을 쓰게 한다 (단계마다 죽은 모델의 타임아웃 비용을 다시 내지 않는다).
+
+    tool 호출 여부로 전략을 나눈다:
+    - tool 호출(병렬 tool_call 사용): 폴백 모델이 병렬 tool을 못 하는 경우가 많아(예: llama-3.3),
+      기본 모델(qwen)을 여러 번 재시도한다 — qwen은 과부하 시 간헐적으로 복구된다.
+    - 비-tool 호출(대화·병합·검증 마무리): 폴백 모델도 문제없이 처리하므로 빠르게 폴백한다.
+    """
+    is_tool_call = bool(kw.get("tools"))
+    primary_delays = (0, 6, 15) if is_tool_call else (0,)
+    try:
+        return await _try_seq(kw, delays=primary_delays)
+    except (RateLimitError, APIStatusError, APIConnectionError) as e:
+        if not _should_fallback(e):
+            raise
+        fb = _next_fallback(kw.get("model"))
+        if not fb:
+            raise
+        # tool 호출에서 폴백 모델로 전환하면 성공해도 캐시에 고정하지 않는다 — 병렬 tool
+        # 비호환으로 다음 tool 단계가 깨질 수 있으니, 각 단계가 기본 모델을 다시 시도하게 둔다.
+        if not is_tool_call:
+            _model_cache["id"] = fb
+        return await _try_seq({**kw, "model": fb}, delays=(0, 4, 12))
 
 
 def to_openai_tools(mcp_tools) -> list[dict]:
@@ -97,25 +157,32 @@ async def stream_chat(system: str, user: str, *, temperature: float = 0.2, max_t
     model = await resolve_model()
     last: Exception | None = None
     stream = None
-    for delay in (0, 3, 8, 20):
-        if delay:
-            await asyncio.sleep(delay)
-        try:
-            stream = await get_llm().chat.completions.create(
-                model=model, temperature=temperature, max_tokens=max_tokens,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                extra_body=NO_THINK, stream=True,
-            )
-            break
-        except RateLimitError as e:
-            last = e
-        except APIStatusError as e:
-            if _transient_status(e):
+    # 스트림 생성 시점까지만 재시도·모델 폴백 (델타를 이미 내보낸 뒤에는 되돌릴 수 없음)
+    for attempt_model in [model] + [m for m in ([DEFAULT_MODEL] + FALLBACK_MODELS) if m != model]:
+        for delay in (0, 3, 8, 20):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                stream = await get_llm().chat.completions.create(**_model_kwargs(dict(
+                    model=attempt_model, temperature=temperature, max_tokens=max_tokens,
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                    extra_body=NO_THINK, stream=True,
+                )))
+                break
+            except RateLimitError as e:
                 last = e
-            else:
-                raise
-        except APIConnectionError as e:
-            last = e
+            except APIStatusError as e:
+                if _transient_status(e):
+                    last = e
+                else:
+                    raise
+            except APIConnectionError as e:
+                last = e
+        if stream is not None:
+            if attempt_model != model:
+                _model_cache["id"] = attempt_model   # 폴백 성공 → 이후 호출도 이 모델 사용
+            break
+        _failed_models.add(attempt_model)
     if stream is None:
         raise last
     try:

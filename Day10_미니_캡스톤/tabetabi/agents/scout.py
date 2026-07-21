@@ -62,7 +62,9 @@ async def run_scout(contract: TripContract, log=None) -> dict:
     )
     out, evidence = await run_tool_agent(
         name="@scout", server=search_mcp, system=SYSTEM, task=task,
-        max_steps=11, log=log, max_tokens=2400,
+        # 프롬프트가 검색을 ≤9회로 제한하므로 스텝은 그보다 약간 여유만. 출력은 일수×활동 수에
+        # 비례해 상향하되, 초대형 요청은 NIM 502 유발 (실측) — 4800이 21일 기준 안전 상한.
+        max_steps=16, log=log, max_tokens=4800,
     )
     evidence_text = "\n---\n".join(evidence)[:6000]   # @critic의 창작 탐지 근거 (D4)
     data = extract_json(out)
