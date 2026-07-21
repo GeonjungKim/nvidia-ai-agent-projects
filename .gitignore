@@ -17,6 +17,11 @@ API.txt
 Day10_미니_캡스톤/sessions.db
 
 # 데이터 DB(Tabelog_Recommendation/app.db)는 배포에 필요하므로 커밋한다 (41MB < GitHub 100MB 제한)
+# 단, 리뷰어 원본 스크랩 JSON은 공개 리포에 올리지 않는다 (C-2: 리뷰어 개인 필드 비노출)
+Tabelog_Recommendation/data/reviewers/
+Tabelog_Recommendation/data/ft/
+# 서브모듈 해제 전 내부 저장소 백업 (복원: .git-backup → .git 이름 변경)
+Tabelog_Recommendation/.git-backup/
 
 # 로컬 도구 설정 (Claude Code)
 .claude/

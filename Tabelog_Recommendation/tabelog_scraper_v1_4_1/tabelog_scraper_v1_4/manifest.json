@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Tabelog Reviewer Scraper (Tree-DFS)",
+  "version": "1.4.2",
+  "description": "리뷰어 방문 식당 리스트를 지역x장르 트리로 적응적 분할 수집. 수업 내 비공개 분석용.",
+  "permissions": ["storage", "unlimitedStorage", "tabs"],
+  "host_permissions": ["*://tabelog.com/rvwr/*"],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://tabelog.com/rvwr/*/visited_restaurants/list*"],
+      "js": ["config.js", "parsers.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
