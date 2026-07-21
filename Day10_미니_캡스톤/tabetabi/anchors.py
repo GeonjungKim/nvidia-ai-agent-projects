@@ -99,9 +99,19 @@ def deviation_km(pref: str, anchor: str, station: str) -> float | None:
     return round(haversine_km(a, b), 1)
 
 
+# 도시권 전철 이동으로 설명 가능한 최대 거리 (이 이상은 광역/타지역 or 좌표 오류)
+_METRO_MAX_KM = 40.0
+
+
 def off_anchor_label(km: float | None) -> str:
-    """이탈 거리 → 카드 라벨. 임계 이내면 빈 문자열."""
+    """이탈 거리 → 카드 라벨. 임계 이내면 빈 문자열.
+
+    거리가 도시권을 넘으면 '전철 N분'(3분/km) 추정이 무의미해진다 — 665km에 1996분 같은
+    허위 정밀도 대신 광역 이동으로만 표기한다 (좌표 오매칭·타지역 근교 트립 모두 안전).
+    """
     if km is None or km <= CLUSTER_RADIUS_KM:
         return ""
+    if km > _METRO_MAX_KM:
+        return f"⚠️ 앵커에서 크게 벗어남 (광역 이동, 직선 {km:.0f}km) — 같은 날 동선으로는 무리일 수 있어요"
     mins = max(round(km * 3), 5)   # 대략 전철 3분/km 추정 (환승 포함 보수적)
     return f"⚠️ 앵커에서 벗어남 (전철 ~{mins}분, 직선 {km}km)"

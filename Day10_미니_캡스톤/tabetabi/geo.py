@@ -21,14 +21,25 @@ def _coords() -> dict[str, dict]:
 
 
 def station_latlng(station: str) -> tuple[float, float] | None:
-    """역 이름(일본어) → (lat, lng). 정확 일치 → 부분 일치 순."""
+    """역 이름(일본어) → (lat, lng). 정확 일치 → 안전한 접두/접미 변형만 허용.
+
+    느슨한 부분일치(station in name)는 현(縣)을 건너뛰는 오매칭을 낳는다 — 실측: 深川(도쿄,
+    좌표 없음)이 上深川(히로시마)에 매칭돼 665km 오차. 그래서 '○○駅'·'○○前' 같은 접미 변형과
+    'query로 시작하는' 후보까지만 허용하고, query가 다른 역명의 '뒷부분'인 경우(上深川)는 배제한다.
+    """
     table = _coords()
     hit = table.get(station)
     if hit is None and station:
-        for name, v in table.items():
-            if station in name or name in station:
-                hit = v
+        # 1) query 자체의 접미 변형 (深川駅·新宿前 등)이 테이블에 있으면 사용
+        for suffix in ("駅", "前", "駅前"):
+            hit = table.get(station + suffix)
+            if hit:
                 break
+    if hit is None and station and len(station) >= 2:
+        # 2) query로 '시작하는' 역만 허용 (표참도→表参道○). 뒷부분 일치(上深川)는 다른 역이라 배제
+        cand = [(name, v) for name, v in table.items() if name.startswith(station)]
+        if cand:
+            hit = min(cand, key=lambda kv: len(kv[0]))[1]   # 가장 짧은 = 가장 근접한 역명
     if hit is None:
         return None
     return float(hit["lat"]), float(hit["lng"])

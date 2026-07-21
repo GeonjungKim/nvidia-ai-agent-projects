@@ -54,6 +54,7 @@ CONCIERGE_SYSTEM = """너는 'TabeTabi' 미식 여행 컨시어지다. 사용자
 - 사용자가 언급한 '고정' 식당·장소·일정은 반드시 locked 배열에 넣는다: {"day": 1부터(미정 0), "slot": "lunch|dinner|activity|stay", "name": "...", "note": "..."}. 이건 절대 바꾸면 안 되는 약속이다.
 - **숙소**: "○○역 쪽에서 묵을 예정"·"○○에 숙소" 같은 말은 stay_area(일본어 역/지명)에 넣는다. notes에만 남기지 마라. 예: "고마고메역 쪽" → stay_area:"駒込". (locked의 stay 슬롯으로 들어와도 stay_area로 승격된다.)
 - **일자별 앵커(day_anchors)**: {"1":"表参道","2":"駒込"}처럼 각 날의 중심 지역. 고정 식당·장소가 있는 날은 그 지역, 마지막 날은 stay_area 인접, 나머지는 areas 순환으로 제안한다. 사용자가 대화로 수정하면 반영한다. 지정 안 하면 비워둬도 코드가 자동 채운다.
+- **중요 — 앵커는 pref(지역) 안의 지명만 쓴다**: 이 앱의 식당 DB는 pref 하나만 검색한다. 사용자가 pref 밖(다른 都道府県)의 근교 나들이를 말하면(예: 도쿄 여행 중 요코하마=가나가와, 가와구치코=야마나시, 가와고에=사이타마), 그날 식당 앵커로 pref 밖 지명을 넣지 마라. 대신 그날은 stay_area나 pref 안 지역을 앵커로 두고, 근교 나들이 계획은 notes에만 적는다. (pref 밖 지명을 앵커로 넣으면 엉뚱한 지역 식당이 추천된다 — 지금은 pref 교차 여행을 지원하지 않는다고 reply에서 정직하게 안내한다.)
 - **theme_park**: 디즈니랜드/USJ 등 종일형 테마파크를 하루 통째로 원하면 true.
 - 사용 가능한 pref 코드(식당 수): «PREFS»
 - genres_pref는 타베로그 장르 표기(일본어)로 변환한다: 라멘→ラーメン, 스시→寿司, 야키니쿠→焼肉, 이자카야→居酒屋, 카페→カフェ.
@@ -332,6 +333,28 @@ def _is_cafe_only(row: dict) -> bool:
     return bool(genres) and genres <= _CAFE_GENRES
 
 
+def _has_cafe_genre(row: dict) -> bool:
+    """카페 계열 장르를 하나라도 포함하는가 — 카페 슬롯 배치 자격 판정."""
+    genres = {g.strip() for g in (row.get("genres") or "").split(",") if g.strip()}
+    return bool(genres & _CAFE_GENRES)
+
+
+# LLM이 추천 이유 자리에 흘리는 사과문·메타 지시문 (실사례: "죄송합니다, 카페 슬롯에는…")
+_REASON_META_MARKERS = ("죄송", "sorry", "슬롯에는", "배치해야", "배치되어야", "규칙상", "죄송합니다",
+                        "출력해야", "지침", "안내드립", "cannot", "unable to", "as an ai")
+
+
+def _clean_reason(reason: str) -> str:
+    """추천 이유 정제 — LLM 사과/자기지시 텍스트가 새어나오면 버린다 (코드 코멘트로 대체됨)."""
+    r = (reason or "").strip()
+    if not r:
+        return ""
+    low = r.lower()
+    if any(m in r or m in low for m in _REASON_META_MARKERS):
+        return ""
+    return r
+
+
 def _gset(text) -> set:
     return {g.strip() for g in (text or "").split(",") if g.strip()}
 
@@ -386,11 +409,15 @@ def _sanitize_foodie(foodie_data: dict, contract: TripContract, log) -> dict:
         slot = str(s.get("slot") or "")
         kept = []
         for c in s.get("candidates") or []:
+            c["reason"] = _clean_reason(c.get("reason", ""))   # LLM 사과문·메타 텍스트 제거 (#3)
             r = rows.get(str(c.get("restaurant_id")))
             if r:
                 c["genres"] = r.get("genres") or ""
                 if slot in ("lunch", "dinner") and _is_cafe_only(r):
                     log(f"[정제] {s.get('day')}일차 {slot}: 카페 계열 후보 제외 ({r['name']})")
+                    continue
+                if slot == "cafe" and not _has_cafe_genre(r):
+                    log(f"[정제] {s.get('day')}일차 카페: 비카페 업태 제외 ({r['name']} · {r.get('genres')})")
                     continue
                 if _below_floor(r):
                     log(f"[정제] {s.get('day')}일차 {slot}: 품질 하한 미달 제외 "
@@ -498,8 +525,11 @@ def _backfill(picks: list[dict], contract: TripContract, anchor_keys: dict[int, 
     have = {(p["day"], p["slot"]) for p in picks}
     used = {p["restaurant_id"] for p in picks if p.get("restaurant_id")}
     day_genres: dict[int, set] = {}
+    trip_genre_count: dict[str, int] = {}          # 여행 전체 장르 사용 횟수 (다양도 균형용, #1)
     for p in picks:
         day_genres.setdefault(p["day"], set()).update(_gset(p.get("genres")))
+        for g in _gset(p.get("genres")):
+            trip_genre_count[g] = trip_genre_count.get(g, 0) + 1
     genres = contract.genres_pref or [None]
     day_anchors = contract.effective_day_anchors()
 
@@ -513,7 +543,13 @@ def _backfill(picks: list[dict], contract: TripContract, anchor_keys: dict[int, 
                 continue   # 시간창 밖 슬롯 — 백필 금지 (항공 시간 반영)
             budget_kw = ({"max_dinner_budget": contract.max_dinner_budget} if slot == "dinner"
                          else {"max_lunch_budget": contract.max_lunch_budget})  # cafe도 점심 예산 준용
-            genre = "カフェ" if slot == "cafe" else genres[(day + i) % len(genres)]
+            # 장르: 여행 전체에서 가장 적게 쓴 선호 장르를 우선한다 (모듈로 순환 → 최소사용 우선, #1 다양도)
+            if slot == "cafe":
+                genre = "カフェ"
+            elif genres and genres[0] is not None:
+                genre = min(genres, key=lambda g: (trip_genre_count.get(g, 0), genres.index(g)))
+            else:
+                genre = None
             taken = day_genres.get(day, set())
             cand, relaxed = None, False
             # 품질 하한 우선(strict → relaxed), 각 단계에서 앵커키 → 장르만 → 전지역 순으로 완화
@@ -526,8 +562,13 @@ def _backfill(picks: list[dict], contract: TripContract, anchor_keys: dict[int, 
                                       **{k: v for k, v in kw.items() if v})
                     ok = [r for r in rows if r["restaurant_id"] not in used
                           and not (slot != "cafe" and _is_cafe_only(r))
+                          and not (slot == "cafe" and not _has_cafe_genre(r))   # 카페 슬롯엔 카페 장르만 (#3)
                           and not (slot == "dinner" and _is_takeout_dinner(r))]
-                    cand = next((r for r in ok if not (_gset(r.get("genres")) & taken)), ok[0] if ok else None)
+                    # 같은 날 장르 중복을 피하되, 동률이면 여행 전체에서 덜 쓴 장르를 우선 (다양도, #1)
+                    fresh = [r for r in ok if not (_gset(r.get("genres")) & taken)]
+                    pool = fresh or ok
+                    cand = min(pool, key=lambda r: sum(trip_genre_count.get(g, 0) for g in _gset(r.get("genres")))) \
+                        if pool else None
                     if cand:
                         relaxed = relax
                         break
@@ -536,6 +577,8 @@ def _backfill(picks: list[dict], contract: TripContract, anchor_keys: dict[int, 
             if cand:
                 used.add(cand["restaurant_id"])
                 day_genres.setdefault(day, set()).update(_gset(cand.get("genres")))
+                for g in _gset(cand.get("genres")):
+                    trip_genre_count[g] = trip_genre_count.get(g, 0) + 1
                 reason = "자동 보충 — 베이지안 랭킹 상위"
                 if relaxed:
                     reason += " · ⚠️ 데이터 희소 지역 — 기준 완화(리뷰≥20)"
@@ -747,6 +790,27 @@ async def run_pipeline(contract: TripContract, log=None, on_partial=None) -> dic
     verdict.setdefault("issues", [])
     verdict["restaurants_checked"] = len(_critic_view(picks))
     verdict["activities_checked"] = len(flat_acts)
+
+    # 예산 검증은 코드가 확정한다 (#4) — critic(LLM)의 관대함에 의존하지 않는다.
+    # 후보 정제·백필이 이미 예산을 강제하므로 위반은 0이어야 한다. locked(사용자 고정)는
+    # 사용자 선택이라 검증 대상에서 뺀다. 위반이 발견되면 픽에서 제거하고 issues에 기록한다.
+    if contract.max_dinner_budget or contract.max_lunch_budget:
+        pick_rows = fetch_by_ids([p["restaurant_id"] for p in picks if p.get("restaurant_id")])
+        kept_picks, budget_issues = [], []
+        for p in picks:
+            r = pick_rows.get(p.get("restaurant_id"))
+            if r and not p.get("locked") and not p.get("external"):
+                over = _over_budget(r, p["slot"], contract)
+                if over:
+                    budget_issues.append(f"{p['day']}일차 {p['slot']} {r['name']}: 하한 ¥{over:,} > 상한 ¥{_budget_cap(contract, p['slot']):,}")
+                    log(f"[예산감사] ⛔ {budget_issues[-1]} → 최종 제거")
+                    continue
+            kept_picks.append(p)
+        if budget_issues:
+            picks = kept_picks
+            verdict["issues"].append("예산 초과 식당을 코드가 최종 제거: " + "; ".join(budget_issues))
+        verdict["budget_checked"] = True
+        log(f"[예산감사] 예산 준수 확인 — 위반 {len(budget_issues)}건 처리")
 
     log("[로지스틱스] 앵커 이탈 검증·동선·딥링크 (결정론 도구)")
     alt_pool_ids = [aid for p in picks for aid in (p.get("alt_ids") or [])]
